@@ -150,7 +150,7 @@ func (s *Server) loadVectorIndex() {
 	}
 	slog.Info("vector index loaded",
 		"documents", totalLoaded, "collections", len(counts), "elapsed", time.Since(start),
-		"algorithms", "flat, hnsw, ivf, pq")
+		"algorithms", strings.Join(searcherNames(s), ", "))
 }
 
 // handleVectorSearch handles POST /v1/vector-search
@@ -199,7 +199,7 @@ func (s *Server) handleVectorSearch(w http.ResponseWriter, r *http.Request) {
 
 	searcher, ok2 := s.VectorSearchers[algo]
 	if !ok2 {
-		bad(w, errors.New("unknown algorithm: "+algo+", available: flat, hnsw, ivf, pq, quantized"))
+		bad(w, errors.New("unknown algorithm: "+algo+", available: "+strings.Join(searcherNames(s), ", ")))
 		return
 	}
 	if !searcher.IsReady() {

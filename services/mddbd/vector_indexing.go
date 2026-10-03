@@ -136,3 +136,15 @@ func newVectorSearchers(flat *vector.VectorIndex, quantized *vector.QuantizedVec
 	}
 	return searchers
 }
+
+// searcherNames lists the enabled vector algorithms, sorted. The set varies
+// under MDDB_VECTOR_ALGORITHMS, so logs and error messages report what is
+// actually loaded rather than the full build list.
+func searcherNames(s *Server) []string {
+	names := make([]string, 0, len(s.VectorSearchers))
+	for name := range s.VectorSearchers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}

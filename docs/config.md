@@ -378,6 +378,7 @@ Query parameters on `GET /v1/audit`: `from` / `to` (RFC3339) or `fromNanos` / `t
 | Env Var | Default | Type | Description |
 |---------|---------|------|-------------|
 | `MDDB_VECTOR_DEFAULT_ALGORITHM` | `"flat"` | string | Default algorithm: `"flat"`, `"hnsw"`, `"ivf"`, `"pq"`, `"opq"`, `"sq"`, `"bq"` |
+| `MDDB_VECTOR_ALGORITHMS` | `""` (all) | csv | Restrict which vector indexes are built and populated. Every stored vector is inserted into every enabled index at startup and on write, so unused algorithms still cost full build time and RAM — e.g. `"flat,quantized"` loads a 40K-chunk index in milliseconds instead of training HNSW/IVF/PQ. `"flat"` and `"quantized"` are always kept: flat is the default query path and quantized backs disk-only collections. Querying an algorithm not in the list returns an error naming the enabled set |
 | `MDDB_VECTOR_BQ_RERANK_FACTOR` | `10` | int | Binary quantization rerank factor |
 | `MDDB_VECTOR_PARALLEL_WORKERS` | `NumCPU` (max 16) | int | Number of goroutines for parallel vector scoring |
 | `MDDB_VECTOR_PARALLEL_MIN_SIZE` | `2048` | int | Minimum collection size to enable parallel search |
