@@ -323,6 +323,10 @@ func (b *Binlog) OldestLSNAfter(cutoff time.Time) (uint64, error) {
 
 // Rotate truncates the binlog, keeping only entries from keepFromLSN onwards.
 // If keepFromLSN is 0, truncates everything.
+//
+// The tail is streamed to a temp file and renamed over the original — the
+// previous version read the whole file into memory first, and an 11 GB binlog
+// OOM-killed the leader mid-rotation (idc01, 2026-10-03).
 func (b *Binlog) Rotate(keepFromLSN uint64) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -337,60 +341,88 @@ func (b *Binlog) Rotate(keepFromLSN uint64) error {
 		return b.truncate()
 	}
 
-	// Read entries to keep
-	f, err := os.Open(b.path)
+	// Find the byte offset of the first entry at/after keepFromLSN. LSNs are
+	// assigned in file order, so one sequential pass suffices.
+	src, err := os.Open(b.path)
 	if err != nil {
 		return err
 	}
-
-	allData, err := io.ReadAll(f)
-	_ = f.Close()
-	if err != nil {
-		return err
-	}
-
-	// Find entries to keep
-	var keepData []byte
-	pos := 0
-	for pos < len(allData) {
-		entry, n, err := UnmarshalBinlogEntry(allData[pos:])
+	r := bufio.NewReaderSize(src, binlogBufferSize)
+	offset := int64(-1)
+	var pos int64
+	for {
+		entry, n, err := readEntry(r)
 		if err != nil {
 			break
 		}
 		if entry.LSN >= keepFromLSN {
-			keepData = allData[pos:]
+			offset = pos
 			break
 		}
-		pos += n
+		pos += int64(n)
+	}
+	_ = src.Close()
+
+	if offset < 0 {
+		// Nothing at/after keepFromLSN — nothing to keep.
+		return b.truncate()
+	}
+	if offset == 0 {
+		return nil // already starts at the keep boundary
 	}
 
-	// Rewrite file
+	// Stream the keep-tail into a sibling temp file.
+	tmp, err := os.CreateTemp(filepath.Dir(b.path), ".binlog-rotate-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	src2, err := os.Open(b.path)
+	if err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if _, err := src2.Seek(offset, io.SeekStart); err != nil {
+		_ = src2.Close()
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	kept, err := io.Copy(tmp, src2)
+	_ = src2.Close()
+	if err == nil {
+		err = tmp.Sync()
+	}
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+
+	// Swap. The writer handle must close before the rename or the appends
+	// after this point would keep writing the unlinked inode.
 	if err := b.file.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, b.path); err != nil {
 		return err
 	}
 
 	// #nosec G304 -- Path is constructed safely
-	file, err := os.OpenFile(filepath.Clean(b.path), os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0600)
+	file, err := os.OpenFile(filepath.Clean(b.path), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
 	if err != nil {
 		return err
 	}
-
 	b.file = file
 	b.writer = bufio.NewWriterSize(file, binlogBufferSize)
+	b.fileSize = kept
+	b.oldestLSN = keepFromLSN
 
-	if len(keepData) > 0 {
-		n, err := b.writer.Write(keepData)
-		if err != nil {
-			return err
-		}
-		b.fileSize = int64(n)
-		b.oldestLSN = keepFromLSN
-	} else {
-		b.fileSize = 0
-		b.oldestLSN = 0
-	}
-
-	return b.flush()
+	return nil
 }
 
 // Close flushes and closes the binlog. It is safe to call Close more than once.
