@@ -2,6 +2,7 @@ package binlog
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -291,6 +292,33 @@ func (b *Binlog) OldestLSN() uint64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.oldestLSN
+}
+
+// MaxSize returns the configured size cap.
+func (b *Binlog) MaxSize() int64 { return b.maxSize }
+
+// MaxAge returns the configured retention window.
+func (b *Binlog) MaxAge() time.Duration { return b.maxAge }
+
+// errScanDone ends OldestLSNAfter's scan once the cutoff is found.
+var errScanDone = errors.New("scan done")
+
+// OldestLSNAfter returns the LSN of the oldest entry written at or after
+// cutoff, or 0 when no entry is that new. Used for age-based retention when
+// no follower position bounds what must be kept.
+func (b *Binlog) OldestLSNAfter(cutoff time.Time) (uint64, error) {
+	var lsn uint64
+	err := b.ScanFrom(0, func(e *BinlogEntry) error {
+		if e.Timestamp >= cutoff.UnixNano() {
+			lsn = e.LSN
+			return errScanDone
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errScanDone) {
+		return 0, err
+	}
+	return lsn, nil
 }
 
 // Rotate truncates the binlog, keeping only entries from keepFromLSN onwards.

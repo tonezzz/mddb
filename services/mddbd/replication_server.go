@@ -73,6 +73,8 @@ type ReplicationServer struct {
 	mu        sync.RWMutex
 	// streamSeq numbers binlog streams so each has its own subscription.
 	streamSeq atomic.Uint64
+	// janitor enforces the binlog's size/age retention (leader only).
+	janitor *binlogJanitor
 }
 
 // FollowerState tracks a connected follower

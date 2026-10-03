@@ -750,10 +750,18 @@ func main() {
 	// Initialize binlog (auto-enabled for leader, opt-in for standalone)
 	binlogEnabled := env("MDDB_BINLOG_ENABLED", "false") == "true" || s.ReplicationRole == "leader"
 	if binlogEnabled {
+		binlogMaxAge := 24 * time.Hour
+		if v := env("MDDB_BINLOG_MAX_AGE", ""); v != "" {
+			if d, err := time.ParseDuration(v); err == nil && d > 0 {
+				binlogMaxAge = d
+			} else {
+				slog.Warn("invalid MDDB_BINLOG_MAX_AGE, using 24h", "value", v)
+			}
+		}
 		bl, err := binlog.NewBinlog(dbPath, binlog.BinlogConfig{
 			Path:    env("MDDB_BINLOG_PATH", ""),
-			MaxSize: 256 * 1024 * 1024, // 256MB
-			MaxAge:  24 * time.Hour,
+			MaxSize: envconf.Int64("MDDB_BINLOG_MAX_SIZE", 256*1024*1024), // 256MB
+			MaxAge:  binlogMaxAge,
 		})
 		if err != nil {
 			logging.Fatal("Failed to initialize binlog", "err", err)

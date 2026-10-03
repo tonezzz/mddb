@@ -93,6 +93,16 @@ func startGRPCServer(s *Server, addr string, opts ...grpc.ServerOption) error {
 		s.replServer = rs
 		proto.RegisterMDDBReplicationServer(grpcServer, rs)
 
+		if s.ReplicationRole == "leader" {
+			// Enforce the binlog's MaxSize/MaxAge; 0 disables the janitor.
+			interval, err := time.ParseDuration(env("MDDB_BINLOG_ROTATE_INTERVAL", "15m"))
+			if err != nil {
+				slog.Warn("invalid MDDB_BINLOG_ROTATE_INTERVAL — binlog retention disabled", "err", err)
+			} else {
+				rs.StartBinlogJanitor(interval)
+			}
+		}
+
 		// SEC-001: snapshot/binlog streams expose the entire DB (incl. auth
 		// hashes). Warn loudly if the leader exposes them with no auth, secret,
 		// or mTLS — authorizeReplication will refuse such calls at runtime.
