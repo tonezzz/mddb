@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -398,6 +399,31 @@ func TestSwapDatabaseHonoursItsVerifier(t *testing.T) {
 	}
 	if got := countDocs(t, s, "blog"); got != 1 {
 		t.Errorf("the server no longer serves its documents: %d", got)
+	}
+}
+
+// The child-progress figures come from /proc: a live pid yields cpu/read
+// figures, a dead or bogus one yields none (and the parent logs elapsed only).
+func TestVerifyProgressReadsProc(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("/proc is Linux-only")
+	}
+	if got := verifyProgress(os.Getpid(), 1024*1024); !strings.Contains(got, "cpu=") {
+		t.Errorf("expected cpu figure for a live pid, got %q", got)
+	}
+	if got := verifyProgress(-1, 1024*1024); got != "" {
+		t.Errorf("a bogus pid should give no figures, got %q", got)
+	}
+}
+
+func TestWithWalkProgressRunsAndReports(t *testing.T) {
+	ran := false
+	if err := withWalkProgress("test walk", nil, func() error { ran = true; return nil }); err != nil || !ran {
+		t.Errorf("withWalkProgress err=%v ran=%v", err, ran)
+	}
+	want := fmt.Errorf("walk failed")
+	if err := withWalkProgress("test walk", nil, func() error { return want }); err != want {
+		t.Errorf("withWalkProgress should return fn's error, got %v", err)
 	}
 }
 

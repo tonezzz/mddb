@@ -137,7 +137,9 @@ func (rs *ReplicationServer) RequestSnapshot(req *proto.SnapshotRequest, stream 
 	// recursivelyCheckBucket), reported at ~1h for a 4GB database under disk
 	// contention. The walk happens once here on the leader instead. It also
 	// proves the copy is a database bbolt can open before any bytes are sent.
-	if err := persistFreelist(tmpPath); err != nil {
+	if err := withWalkProgress("persisting snapshot freelist", []any{"followerID", followerID}, func() error {
+		return persistFreelist(tmpPath)
+	}); err != nil {
 		slog.Warn("Replication snapshot freelist flush failed", "followerID", followerID, "err", err)
 		return status.Error(codes.Internal, err.Error())
 	}

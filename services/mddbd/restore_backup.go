@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 
 	"mddb/internal/vector"
+
+	bolt "go.etcd.io/bbolt"
 )
 
 // Manual backup restore (SEC-015 / SEC-016).
@@ -90,7 +92,14 @@ func (s *Server) swapDatabaseVerified(source string, install func(dst string) er
 	}
 
 	reopen := func() error {
-		db, err := openBolt(s.Path, getOptimizedBoltOptions())
+		var db *bolt.DB
+		// An unsynced file rebuilds its freelist here by walking every page —
+		// silent for the whole walk without the progress reporting.
+		err := withWalkProgress("reopening database", nil, func() error {
+			var oerr error
+			db, oerr = openBolt(s.Path, getOptimizedBoltOptions())
+			return oerr
+		})
 		if err != nil {
 			return err
 		}

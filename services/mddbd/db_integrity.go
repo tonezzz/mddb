@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -72,6 +75,11 @@ func verifySnapshot(path string) error {
 	return runVerifyChildProcess(path, true)
 }
 
+// verifyProgressInterval is how often a running walk is reported. The checks
+// used to be silent for their whole run — over an hour on a large database
+// under disk contention — which reads exactly like a hang.
+const verifyProgressInterval = 30 * time.Second
+
 // runVerifyChildProcess runs the checker child. openOnly skips the full
 // invariant check after the open proof (see verifyOpenOnlyEnv).
 func runVerifyChildProcess(path string, openOnly bool) error {
@@ -88,14 +96,109 @@ func runVerifyChildProcess(path string, openOnly bool) error {
 	if openOnly {
 		cmd.Env = append(cmd.Env, verifyOpenOnlyEnv+"=1")
 	}
-	out, err := cmd.CombinedOutput()
-	if ctx.Err() != nil {
-		return fmt.Errorf("%s: integrity check did not finish within %s (MDDB_VERIFY_TIMEOUT)", filepath.Base(path), verifyTimeout())
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("cannot run the integrity check: %w", err)
 	}
-	if err != nil {
-		return fmt.Errorf("%s fails bbolt's integrity check: %s", filepath.Base(path), failureReason(string(out)))
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	var size int64
+	if info, statErr := os.Stat(path); statErr == nil {
+		size = info.Size()
 	}
-	return nil
+	started := time.Now()
+	ticker := time.NewTicker(verifyProgressInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case err := <-done:
+			if ctx.Err() != nil {
+				return fmt.Errorf("%s: integrity check did not finish within %s (MDDB_VERIFY_TIMEOUT)", filepath.Base(path), verifyTimeout())
+			}
+			if err != nil {
+				return fmt.Errorf("%s fails bbolt's integrity check: %s", filepath.Base(path), failureReason(out.String()))
+			}
+			slog.Info("database integrity check finished",
+				"file", filepath.Base(path), "elapsed", time.Since(started).Round(time.Second))
+			return nil
+		case <-ticker.C:
+			attrs := []any{"file", filepath.Base(path), "elapsed", time.Since(started).Round(time.Second)}
+			if p := verifyProgress(cmd.Process.Pid, size); p != "" {
+				attrs = append(attrs, "progress", p)
+			}
+			slog.Info("database integrity check still running", attrs...)
+		}
+	}
+}
+
+// verifyProgress describes the checker child's progress from /proc — Linux
+// only, "" elsewhere. mmap page-ins count toward read_bytes and CPU ticks
+// accrue either way, so the figures move during both the freelist walk and
+// tx.Check() even though bbolt never calls read() on the file.
+func verifyProgress(pid int, size int64) string {
+	ioData, ioErr := os.ReadFile(fmt.Sprintf("/proc/%d/io", pid))      //nolint:gosec // G703: pid is our child's
+	statData, statErr := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid)) //nolint:gosec // G703: pid is our child's
+	if ioErr != nil && statErr != nil {
+		return ""
+	}
+	var parts []string
+	if statErr == nil {
+		// Fields after the (comm) group: state, ppid, … utime is field 14 and
+		// stime 15 of the stat line → indexes 11 and 12 here. 100 ticks/sec.
+		if i := bytes.LastIndexByte(statData, ')'); i >= 0 {
+			if f := bytes.Fields(statData[i+1:]); len(f) > 12 {
+				utime, _ := strconv.ParseInt(string(f[11]), 10, 64)
+				stime, _ := strconv.ParseInt(string(f[12]), 10, 64)
+				parts = append(parts, fmt.Sprintf("cpu=%ds", (utime+stime)/100))
+			}
+		}
+	}
+	if ioErr == nil && size > 0 {
+		for _, line := range strings.Split(string(ioData), "\n") {
+			v, ok := strings.CutPrefix(line, "read_bytes: ")
+			if !ok {
+				continue
+			}
+			if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
+				pct := n * 100 / size
+				if pct > 100 {
+					pct = 100
+				}
+				parts = append(parts, fmt.Sprintf("read=%d%% (%d/%d MiB)", pct, n>>20, size>>20))
+			}
+			break
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// withWalkProgress runs fn while logging it every verifyProgressInterval —
+// bbolt's page walks are silent for their whole run, which reads exactly like
+// a hang — and reports the elapsed time at the end when it took a moment.
+func withWalkProgress(what string, attrs []any, fn func() error) error {
+	start := time.Now()
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(verifyProgressInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				slog.Info(what+" still running", append([]any{"elapsed", time.Since(start).Round(time.Second)}, attrs...)...)
+			case <-done:
+				return
+			}
+		}
+	}()
+	err := fn()
+	close(done)
+	if elapsed := time.Since(start); elapsed >= time.Second {
+		slog.Info(what+" done", append([]any{"elapsed", elapsed.Round(time.Second)}, attrs...)...)
+	}
+	return err
 }
 
 // runVerifyChild is the child side: open the file as the server would, run
