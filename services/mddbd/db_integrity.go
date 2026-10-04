@@ -49,10 +49,32 @@ func verifyTimeout() time.Duration {
 	return time.Hour
 }
 
+// verifyOpenOnlyEnv tells the checker child to stop after proving the file
+// opens — freelist walk included — and skip tx.Check()'s page-by-page
+// invariant walk. Set only for trusted material: a replication snapshot that
+// arrived complete over the stream and was already opened on the leader. A
+// restore file is untrusted by comparison and keeps the whole check.
+const verifyOpenOnlyEnv = "MDDB_INTERNAL_VERIFY_OPEN_ONLY"
+
 // verifyDatabase reports whether the file at path passes bbolt's integrity
 // check, run in a child process. The error carries bbolt's own description of
 // the damage.
 func verifyDatabase(path string) error {
+	return runVerifyChildProcess(path, false)
+}
+
+// verifySnapshot proves a replication snapshot the cheap way: the child opens
+// it exactly as the server would — freelist walk included, still the open
+// where a damaged page tree panics — and skips tx.Check(), the
+// O(every-page) invariant walk reported at over 6h for a ~4GB snapshot on a
+// contended disk.
+func verifySnapshot(path string) error {
+	return runVerifyChildProcess(path, true)
+}
+
+// runVerifyChildProcess runs the checker child. openOnly skips the full
+// invariant check after the open proof (see verifyOpenOnlyEnv).
+func runVerifyChildProcess(path string, openOnly bool) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("cannot run the integrity check: %w", err)
@@ -63,6 +85,9 @@ func verifyDatabase(path string) error {
 	// #nosec G204 -- runs this binary, with the path passed in the environment
 	cmd := exec.CommandContext(ctx, exe)
 	cmd.Env = append(os.Environ(), verifyChildEnv+"="+path)
+	if openOnly {
+		cmd.Env = append(cmd.Env, verifyOpenOnlyEnv+"=1")
+	}
 	out, err := cmd.CombinedOutput()
 	if ctx.Err() != nil {
 		return fmt.Errorf("%s: integrity check did not finish within %s (MDDB_VERIFY_TIMEOUT)", filepath.Base(path), verifyTimeout())
@@ -88,6 +113,11 @@ func runVerifyChild(path string) int {
 		return 1
 	}
 	defer func() { _ = db.Close() }()
+
+	if os.Getenv(verifyOpenOnlyEnv) != "" {
+		fmt.Println("ok")
+		return 0
+	}
 
 	var problems []string
 	_ = db.View(func(tx *bolt.Tx) error {

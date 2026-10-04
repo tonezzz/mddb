@@ -329,9 +329,14 @@ func (rc *ReplicationClient) requestSnapshot(ctx context.Context) error {
 // created and is about to delete, and copying a multi-gigabyte file to throw
 // the original away is waste.
 func (rc *ReplicationClient) replaceDatabase(snapshotPath string) error {
-	return rc.server.swapDatabase(snapshotPath, func(dst string) error {
+	// verifySnapshot, not verifyDatabase: the snapshot is trusted material
+	// that arrived complete over the stream (and was already opened on the
+	// leader), so the child proves it opens — freelist walk and panic class
+	// included — and skips the O(every-page) invariant check that used to
+	// time out at MDDB_VERIFY_TIMEOUT on large databases.
+	return rc.server.swapDatabaseVerified(snapshotPath, func(dst string) error {
 		return os.Rename(snapshotPath, dst)
-	})
+	}, verifySnapshot)
 }
 
 // ackLoop periodically sends LSN acknowledgments to the leader

@@ -339,6 +339,68 @@ func TestPersistFreelistWritesAFreelistIntoTheFile(t *testing.T) {
 	}
 }
 
+// The open-only proof a trusted snapshot gets: a usable database passes, a
+// file that is not a database still fails, and — because the child performs
+// the same freelist walk a real open does — a damaged page tree is still
+// contained in the child rather than in the reopen.
+func TestVerifySnapshotProvesTheFileOpens(t *testing.T) {
+	good := filepath.Join(t.TempDir(), "ok.db")
+	writeTestDB(t, good, 500)
+	if err := verifySnapshot(good); err != nil {
+		t.Fatalf("a healthy database failed the snapshot check: %v", err)
+	}
+
+	text := filepath.Join(t.TempDir(), "text.db")
+	if err := os.WriteFile(text, []byte(strings.Repeat("not a database ", 1000)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifySnapshot(text); err == nil {
+		t.Error("a text file passed the snapshot check")
+	}
+	if err := verifySnapshot(filepath.Join(t.TempDir(), "missing.db")); err == nil {
+		t.Error("a missing file passed the snapshot check")
+	}
+}
+
+func TestVerifySnapshotStillCatchesThePanicClass(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bad.db")
+	writeTestDB(t, path, 5000)
+	corruptBranchPage(t, path)
+	// The unsynced file has no freelist, so the child's open walks the page
+	// tree — and the damaged tree still fails there, without tx.Check().
+	if err := verifySnapshot(path); err == nil {
+		t.Error("a damaged database passed the snapshot check")
+	}
+}
+
+// swapDatabaseVerified must honour the verifier it is given — a refused
+// source is rejected before the live database is touched.
+func TestSwapDatabaseHonoursItsVerifier(t *testing.T) {
+	s, cleanup := newHandlerTestServer(t)
+	defer cleanup()
+	addTestDoc(t, s, "blog", "kept", "en", "# still here", nil)
+
+	source := filepath.Join(t.TempDir(), "good.db")
+	writeTestDB(t, source, 100)
+
+	installed := false
+	err := s.withRestoreLock(func() error {
+		return s.swapDatabaseVerified(source, func(dst string) error {
+			installed = true
+			return copyFile(source, dst)
+		}, func(string) error { return fmt.Errorf("refused by verifier") })
+	})
+	if err == nil || !strings.Contains(err.Error(), "not a usable database") {
+		t.Fatalf("swapDatabaseVerified with a refusing verifier: %v", err)
+	}
+	if installed {
+		t.Error("install ran for a source the verifier refused")
+	}
+	if got := countDocs(t, s, "blog"); got != 1 {
+		t.Errorf("the server no longer serves its documents: %d", got)
+	}
+}
+
 func TestFailureReasonPrefersBboltsWords(t *testing.T) {
 	if got := failureReason("goroutine 1\npanic: freepages: page 4: multiple references\nstack"); got != "freepages: page 4: multiple references" {
 		t.Errorf("panic output: %q", got)
