@@ -181,6 +181,15 @@ func (rs *ReplicationServer) StreamBinlog(req *proto.StreamBinlogRequest, stream
 
 	fromLSN := req.FromLsn
 
+	// Anything below the file's oldest entry is gone — including 0. ScanFrom
+	// only rejects 0 < fromLSN < oldest, so a fresh follower (fromLSN 0)
+	// would otherwise be fed every entry the log still holds: replaying the
+	// whole retained history, entry by entry, is strictly worse than taking
+	// the snapshot stream the client falls back to on this same error.
+	if oldest := rs.server.Binlog.OldestLSN(); oldest > 0 && fromLSN < oldest {
+		return status.Error(codes.FailedPrecondition, "LSN too old, snapshot required")
+	}
+
 	// Track follower
 	addr := ""
 	if p, ok := peer.FromContext(stream.Context()); ok {
