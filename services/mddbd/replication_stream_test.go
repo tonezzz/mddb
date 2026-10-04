@@ -9,6 +9,9 @@ import (
 
 	"mddb/internal/binlog"
 	proto "mddb/proto"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // The binlog stream a follower tails (#267 comment). Three ways it lost or
@@ -55,13 +58,16 @@ func appendN(t *testing.T, bl *binlog.Binlog, n int) {
 	}
 }
 
-// runBinlogStream starts a stream and waits until it has sent through want.
-func runBinlogStream(t *testing.T, rs *ReplicationServer, id string, stream *recordingStream, want uint64) (cancel func(), done <-chan error) {
+// runBinlogStream starts a stream from fromLSN and waits until it has sent
+// through want. fromLSN must not be below the binlog's oldest entry: those
+// requests — a fresh follower's 0 included — are refused so the follower
+// takes the snapshot path instead.
+func runBinlogStream(t *testing.T, rs *ReplicationServer, id string, fromLSN uint64, stream *recordingStream, want uint64) (cancel func(), done <-chan error) {
 	t.Helper()
 	ctx, cancelCtx := context.WithCancel(stream.ctx)
 	stream.ctx = ctx
 	errc := make(chan error, 1)
-	go func() { errc <- rs.StreamBinlog(&proto.StreamBinlogRequest{FollowerId: id}, stream) }()
+	go func() { errc <- rs.StreamBinlog(&proto.StreamBinlogRequest{FollowerId: id, FromLsn: fromLSN}, stream) }()
 
 	deadline := time.Now().Add(10 * time.Second)
 	for {
@@ -85,16 +91,16 @@ func lastOf(l []uint64) uint64 {
 	return l[len(l)-1]
 }
 
-// assertContiguous checks the follower got every LSN from 1 to want, once,
-// in order — the property replication depends on.
-func assertContiguous(t *testing.T, got []uint64, want uint64) {
+// assertContiguous checks the follower got every LSN from first to last,
+// once, in order — the property replication depends on.
+func assertContiguous(t *testing.T, got []uint64, first, last uint64) {
 	t.Helper()
-	if uint64(len(got)) != want {
-		t.Fatalf("received %d entries, want %d", len(got), want)
+	if uint64(len(got)) != last-first+1 {
+		t.Fatalf("received %d entries, want %d..%d", len(got), first, last)
 	}
 	for i, lsn := range got {
-		if lsn != uint64(i)+1 {
-			t.Fatalf("entry %d has LSN %d, want %d — the follower has a gap", i, lsn, i+1)
+		if want := first + uint64(i); lsn != want {
+			t.Fatalf("entry %d has LSN %d, want %d — the follower has a gap", i, lsn, want)
 		}
 	}
 }
@@ -111,18 +117,19 @@ func TestEntriesWrittenDuringTheReplayReachTheFollower(t *testing.T) {
 		// Writes keep arriving while the history is being sent.
 		once.Do(func() { appendN(t, bl, 50) })
 	}
-	cancel, done := runBinlogStream(t, rs, "f1", stream, 150)
+	// FromLsn 1 is the file's oldest: the replay covers 2..100, then the 50.
+	cancel, done := runBinlogStream(t, rs, "f1", 1, stream, 150)
 	cancel()
 	<-done
 
-	assertContiguous(t, stream.received(), 150)
+	assertContiguous(t, stream.received(), 2, 150)
 }
 
 func TestAFollowerThatFallsBehindTheBufferGetsEveryEntry(t *testing.T) {
 	s, bl, cleanup := replTestServer(t)
 	defer cleanup()
 	rs := NewReplicationServer(s)
-	appendN(t, bl, 1)
+	appendN(t, bl, 2)
 
 	release := make(chan struct{})
 	stream := &recordingStream{ctx: authedReplCtx(t, "s")}
@@ -134,10 +141,18 @@ func TestAFollowerThatFallsBehindTheBufferGetsEveryEntry(t *testing.T) {
 	ctx, cancelCtx := context.WithCancel(stream.ctx)
 	stream.ctx = ctx
 	done := make(chan error, 1)
-	go func() { done <- rs.StreamBinlog(&proto.StreamBinlogRequest{FollowerId: "f1"}, stream) }()
+	// FromLsn 1 is the file's oldest: the replay sends entry 2, then the
+	// follower stalls and the burst below overflows its subscription buffer.
+	go func() {
+		done <- rs.StreamBinlog(&proto.StreamBinlogRequest{FollowerId: "f1", FromLsn: 1}, stream)
+	}()
 
-	for len(stream.received()) < 1 {
+	deadline := time.Now().Add(10 * time.Second)
+	for len(stream.received()) < 1 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
+	}
+	if len(stream.received()) == 0 {
+		t.Fatal("stream sent nothing")
 	}
 	// A bulk import while the follower is stalled: more than the subscription
 	// buffer holds, so the binlog drops the excess.
@@ -145,13 +160,12 @@ func TestAFollowerThatFallsBehindTheBufferGetsEveryEntry(t *testing.T) {
 	appendN(t, bl, burst)
 	close(release)
 
-	deadline := time.Now().Add(10 * time.Second)
-	for lastOf(stream.received()) < burst+1 && time.Now().Before(deadline) {
+	for lastOf(stream.received()) < uint64(burst)+2 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	cancelCtx()
 	<-done
-	assertContiguous(t, stream.received(), burst+1)
+	assertContiguous(t, stream.received(), 2, uint64(burst)+2)
 }
 
 // A follower that reconnects under the same ID before its old stream has
@@ -160,12 +174,12 @@ func TestAReconnectedFollowerKeepsItsStream(t *testing.T) {
 	s, bl, cleanup := replTestServer(t)
 	defer cleanup()
 	rs := NewReplicationServer(s)
-	appendN(t, bl, 1)
+	appendN(t, bl, 2)
 
 	old := &recordingStream{ctx: authedReplCtx(t, "s")}
-	cancelOld, oldDone := runBinlogStream(t, rs, "f1", old, 1)
+	cancelOld, oldDone := runBinlogStream(t, rs, "f1", 1, old, 2)
 	fresh := &recordingStream{ctx: authedReplCtx(t, "s")}
-	cancelFresh, freshDone := runBinlogStream(t, rs, "f1", fresh, 1)
+	cancelFresh, freshDone := runBinlogStream(t, rs, "f1", 1, fresh, 2)
 	defer func() { cancelFresh(); <-freshDone }()
 
 	cancelOld()
@@ -183,10 +197,38 @@ func TestAReconnectedFollowerKeepsItsStream(t *testing.T) {
 
 	appendN(t, bl, 1)
 	deadline := time.Now().Add(5 * time.Second)
-	for lastOf(fresh.received()) < 2 && time.Now().Before(deadline) {
+	for lastOf(fresh.received()) < 3 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
-	if lastOf(fresh.received()) != 2 {
+	if lastOf(fresh.received()) != 3 {
 		t.Errorf("the reconnected stream stopped receiving: %v", fresh.received())
 	}
+}
+
+// A follower asking below the file's oldest entry — a fresh follower's LSN 0
+// included — is sent to the snapshot path, not fed the whole retained log.
+func TestAFollowerBelowTheOldestLSNGetsFailedPrecondition(t *testing.T) {
+	s, bl, cleanup := replTestServer(t)
+	defer cleanup()
+	rs := NewReplicationServer(s)
+	appendN(t, bl, 10)
+
+	// Trim so the file starts at 5: both 0 and a mid-history LSN are below it.
+	if err := bl.Rotate(5); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	for _, from := range []uint64{0, 4} {
+		stream := &recordingStream{ctx: authedReplCtx(t, "s")}
+		err := rs.StreamBinlog(&proto.StreamBinlogRequest{FollowerId: "f1", FromLsn: from}, stream)
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Errorf("FromLsn %d below oldest 5: got %v, want FailedPrecondition", from, err)
+		}
+	}
+
+	// At the oldest the stream still works — the kept tail is replayed.
+	stream := &recordingStream{ctx: authedReplCtx(t, "s")}
+	cancel, done := runBinlogStream(t, rs, "f1", 5, stream, 10)
+	cancel()
+	<-done
+	assertContiguous(t, stream.received(), 6, 10)
 }
