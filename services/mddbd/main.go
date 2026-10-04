@@ -231,14 +231,26 @@ type DeleteCollectionRequest struct {
 // MDDB_FREELIST_SYNC=true writes it on every commit instead, so an open reads
 // one page. The first open with it set still walks once, to write it.
 
+// freelistSyncEnabled reports whether commits persist the freelist. An
+// explicit MDDB_FREELIST_SYNC always wins; on a replication follower it
+// defaults to true — a follower is read-mostly, so the write cost barely
+// registers, while every restart and every snapshot swap would otherwise pay
+// the full page-walk rebuild again.
+func freelistSyncEnabled() bool {
+	if v := os.Getenv("MDDB_FREELIST_SYNC"); v != "" {
+		return v == "true"
+	}
+	return env("MDDB_REPLICATION_ROLE", "") == "follower"
+}
+
 // getOptimizedBoltOptions returns optimized BoltDB options for performance
 func getOptimizedBoltOptions() *bolt.Options {
 	return &bolt.Options{
 		Timeout:         2 * time.Second,
-		NoFreelistSync:  os.Getenv("MDDB_FREELIST_SYNC") != "true", // see freelistSyncNote
-		FreelistType:    bolt.FreelistMapType,                      // Use hashmap for freelist (faster than array)
-		NoGrowSync:      false,                                     // Sync after growing mmap (safer)
-		InitialMmapSize: 100 * 1024 * 1024,                         // 100MB initial mmap (reduce remapping)
+		NoFreelistSync:  !freelistSyncEnabled(), // see freelistSyncNote
+		FreelistType:    bolt.FreelistMapType,   // Use hashmap for freelist (faster than array)
+		NoGrowSync:      false,                  // Sync after growing mmap (safer)
+		InitialMmapSize: 100 * 1024 * 1024,      // 100MB initial mmap (reduce remapping)
 	}
 }
 

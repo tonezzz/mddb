@@ -1500,6 +1500,39 @@ func TestMainGetOptimizedBoltOptions(t *testing.T) {
 	}
 }
 
+// A replication follower defaults to syncing the freelist: it is read-mostly,
+// so the commit cost is minor next to paying the page-walk rebuild on every
+// restart and every snapshot swap. An explicit MDDB_FREELIST_SYNC still wins
+// in both directions.
+func TestFreelistSyncDefaultsOnForFollowers(t *testing.T) {
+	t.Setenv("MDDB_FREELIST_SYNC", "")
+	t.Setenv("MDDB_REPLICATION_ROLE", "follower")
+	if !freelistSyncEnabled() {
+		t.Error("follower without MDDB_FREELIST_SYNC should default to syncing")
+	}
+	if getOptimizedBoltOptions().NoFreelistSync {
+		t.Error("follower without MDDB_FREELIST_SYNC should get NoFreelistSync=false")
+	}
+
+	t.Setenv("MDDB_REPLICATION_ROLE", "")
+	if freelistSyncEnabled() {
+		t.Error("standalone/leader without MDDB_FREELIST_SYNC should not sync")
+	}
+}
+
+func TestFreelistSyncEnvOverridesFollowerDefault(t *testing.T) {
+	t.Setenv("MDDB_REPLICATION_ROLE", "follower")
+	t.Setenv("MDDB_FREELIST_SYNC", "false")
+	if freelistSyncEnabled() {
+		t.Error("explicit MDDB_FREELIST_SYNC=false should win on a follower")
+	}
+	t.Setenv("MDDB_FREELIST_SYNC", "true")
+	t.Setenv("MDDB_REPLICATION_ROLE", "")
+	if !freelistSyncEnabled() {
+		t.Error("explicit MDDB_FREELIST_SYNC=true should win on a non-follower")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // addDocument - edge cases
 // ---------------------------------------------------------------------------

@@ -124,7 +124,7 @@ over 40 minutes on a busy spinning disk
 
 | Variable | Default | Effect |
 |---|---|---|
-| `MDDB_FREELIST_SYNC` | `false` | `true` writes the freelist on every commit, so an open reads one page instead of walking the file. Writes are slightly slower. The first open with it set still walks once, to write the freelist. |
+| `MDDB_FREELIST_SYNC` | `false` (`true` on replication followers) | `true` writes the freelist on every commit, so an open reads one page instead of walking the file. Writes are slightly slower. The first open with it set still walks once, to write the freelist. Replication followers default to `true` — they are read-mostly, and every restart and snapshot swap would otherwise pay the walk again. |
 
 ## When the database is damaged at startup
 
