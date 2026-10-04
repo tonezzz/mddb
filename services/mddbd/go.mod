@@ -10,10 +10,10 @@ require (
 	github.com/bits-and-blooms/bloom/v3 v3.7.1
 	github.com/blevesearch/snowballstem v0.9.0
 	github.com/coder/hnsw v0.6.1
-	github.com/goccy/go-json v0.10.6
+	github.com/goccy/go-json v0.11.2
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/golang/snappy v1.0.0
-	github.com/klauspost/compress v1.20.0
+	github.com/klauspost/compress v1.20.1
 	github.com/minio/minio-go/v7 v7.3.0
 	github.com/quic-go/quic-go v0.63.0
 	github.com/robfig/cron/v3 v3.0.1
