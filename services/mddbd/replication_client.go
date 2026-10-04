@@ -216,6 +216,15 @@ func (rc *ReplicationClient) replicate() error {
 			return nil
 		}
 		if err != nil {
+			if st, ok := status.FromError(err); ok && st.Code() == codes.FailedPrecondition {
+				// Server-side rejection arrives on Recv, not the dial — the
+				// stream opens fine. Same recovery as the dial-time check.
+				slog.Info("replication LSN too old, requesting full snapshot")
+				if err := rc.requestSnapshot(ctx); err != nil {
+					return fmt.Errorf("snapshot failed: %w", err)
+				}
+				return nil
+			}
 			return fmt.Errorf("stream recv error: %w", err)
 		}
 
