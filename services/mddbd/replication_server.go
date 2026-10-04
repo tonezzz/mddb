@@ -9,6 +9,7 @@ import (
 	"mddb/internal/binlog"
 	proto "mddb/proto"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -112,49 +113,71 @@ func (rs *ReplicationServer) RequestSnapshot(req *proto.SnapshotRequest, stream 
 	// Record the LSN at snapshot time
 	snapshotLSN := rs.server.Binlog.CurrentLSN()
 
-	// Use BoltDB's read-only transaction to stream the database
-	err := rs.server.DBView(func(tx *bolt.Tx) error {
-		pr, pw := io.Pipe()
+	// Copy the database image to a temp file first: the read transaction is
+	// then held for a local copy instead of the whole network stream.
+	tmp, err := os.CreateTemp(filepath.Dir(rs.server.Path), "mddb-snapshot-*.db")
+	if err != nil {
+		return status.Errorf(codes.Internal, "snapshot temp file: %v", err)
+	}
+	tmpPath := tmp.Name()
+	_ = tmp.Close()
+	defer func() { _ = os.Remove(tmpPath) }()
 
-		// Write snapshot to pipe in background
-		go func() {
-			_, err := tx.WriteTo(pw)
-			pw.CloseWithError(err)
-		}()
+	if err := rs.server.DBView(func(tx *bolt.Tx) error {
+		return tx.CopyFile(tmpPath, 0o600)
+	}); err != nil {
+		slog.Warn("Replication snapshot copy failed", "followerID", followerID, "err", err)
+		return status.Error(codes.Internal, err.Error())
+	}
 
-		buf := make([]byte, snapshotChunkSize)
-		var offset uint64
-		totalSize := uint64(tx.Size()) // #nosec G115 -- db size always non-negative
+	// Persist the freelist into the copy before streaming. mddb runs with
+	// NoFreelistSync, so the image carries none and every open on the
+	// follower — the integrity check, the restore reopen, every restart —
+	// would rebuild it by walking every page (freepages →
+	// recursivelyCheckBucket), reported at ~1h for a 4GB database under disk
+	// contention. The walk happens once here on the leader instead. It also
+	// proves the copy is a database bbolt can open before any bytes are sent.
+	if err := persistFreelist(tmpPath); err != nil {
+		slog.Warn("Replication snapshot freelist flush failed", "followerID", followerID, "err", err)
+		return status.Error(codes.Internal, err.Error())
+	}
 
-		for {
-			n, err := pr.Read(buf)
-			if n > 0 {
-				chunk := &proto.SnapshotChunk{
-					Data:        buf[:n],
-					Offset:      offset,
-					TotalSize:   totalSize,
-					IsLast:      err == io.EOF,
-					SnapshotLsn: snapshotLSN,
-				}
-				if sendErr := stream.Send(chunk); sendErr != nil {
-					_ = pr.Close()
-					return fmt.Errorf("failed to send snapshot chunk: %w", sendErr)
-				}
-				offset += uint64(n)
+	// #nosec G304 -- the temp file this handler just created
+	f, err := os.Open(filepath.Clean(tmpPath))
+	if err != nil {
+		return status.Errorf(codes.Internal, "snapshot reopen: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	info, err := f.Stat()
+	if err != nil {
+		return status.Errorf(codes.Internal, "snapshot stat: %v", err)
+	}
+	totalSize := uint64(info.Size()) // #nosec G115 -- file size is non-negative
+
+	buf := make([]byte, snapshotChunkSize)
+	var offset uint64
+	for {
+		n, err := f.Read(buf)
+		if n > 0 {
+			offset += uint64(n)
+			chunk := &proto.SnapshotChunk{
+				Data:        buf[:n],
+				Offset:      offset - uint64(n),
+				TotalSize:   totalSize,
+				IsLast:      offset == totalSize,
+				SnapshotLsn: snapshotLSN,
 			}
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				return fmt.Errorf("failed to read snapshot: %w", err)
+			if sendErr := stream.Send(chunk); sendErr != nil {
+				return fmt.Errorf("failed to send snapshot chunk: %w", sendErr)
 			}
 		}
-		return nil
-	})
-
-	if err != nil {
-		slog.Warn("Replication snapshot failed", "followerID", followerID, "err", err)
-		return status.Error(codes.Internal, err.Error())
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return status.Errorf(codes.Internal, "failed to read snapshot: %v", err)
+		}
 	}
 
 	slog.Info("replication snapshot completed", "followerID", followerID, "snapshotLSN", snapshotLSN)

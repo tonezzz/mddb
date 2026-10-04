@@ -107,6 +107,25 @@ func runVerifyChild(path string) int {
 	return 0
 }
 
+// persistFreelist writes a freelist into a database file that has none.
+//
+// mddb runs with NoFreelistSync, so a file image — a backup, a replication
+// snapshot — carries no freelist and every open rebuilds it by walking every
+// page. bbolt flushes a freelist into the file itself when a syncing handle
+// opens an unsynced file, which is the whole of this function: the walk runs
+// once, here, instead of on every later open of the copy.
+func persistFreelist(path string) error {
+	db, err := openBolt(path, &bolt.Options{
+		NoFreelistSync: false,
+		FreelistType:   bolt.FreelistMapType,
+		Timeout:        5 * time.Second,
+	})
+	if err != nil {
+		return err
+	}
+	return db.Close()
+}
+
 // openBolt opens a database and turns a panic inside bbolt into an error, so a
 // damaged file is reported rather than taking down the goroutine that opened
 // it. See the note above for why this is a last line of defence, not a check.

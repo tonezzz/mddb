@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -400,6 +401,105 @@ func TestAuthorizeReplication_MissingMetadataDenies(t *testing.T) {
 	if status.Code(err) != codes.PermissionDenied {
 		t.Fatalf("expected PermissionDenied for missing metadata, got %v", status.Code(err))
 	}
+}
+
+// captureSnapshotStream collects the chunks a real RequestSnapshot sends.
+// Data is copied: the handler reuses its read buffer between Sends.
+type captureSnapshotStream struct {
+	proto.MDDBReplication_RequestSnapshotServer
+	ctx    context.Context
+	chunks []*proto.SnapshotChunk
+}
+
+func (s *captureSnapshotStream) Context() context.Context { return s.ctx }
+func (s *captureSnapshotStream) Send(c *proto.SnapshotChunk) error {
+	s.chunks = append(s.chunks, &proto.SnapshotChunk{
+		Data:        append([]byte(nil), c.Data...),
+		Offset:      c.Offset,
+		TotalSize:   c.TotalSize,
+		IsLast:      c.IsLast,
+		SnapshotLsn: c.SnapshotLsn,
+	})
+	return nil
+}
+
+// A snapshot must arrive as a complete database image carrying a synced
+// freelist: without one, every open on the follower rebuilds the freelist by
+// walking every page.
+func TestRequestSnapshot_StreamsADatabaseWithSyncedFreelist(t *testing.T) {
+	s, _, cleanup := replTestServer(t)
+	defer cleanup()
+
+	// Give the database real contents plus free pages to list.
+	if err := s.DBUpdate(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists([]byte("docs"))
+		if err != nil {
+			return err
+		}
+		for i := 0; i < 200; i++ {
+			if err := b.Put([]byte(fmt.Sprintf("key-%04d", i)), []byte("value")); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DBUpdate(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte("docs"))
+		for i := 0; i < 100; i++ {
+			if err := b.Delete([]byte(fmt.Sprintf("key-%04d", i))); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rs := NewReplicationServer(s)
+	stream := &captureSnapshotStream{ctx: authedReplCtx(t, "s")}
+	if err := rs.RequestSnapshot(&proto.SnapshotRequest{FollowerId: "f1"}, stream); err != nil {
+		t.Fatalf("RequestSnapshot: %v", err)
+	}
+	if len(stream.chunks) == 0 {
+		t.Fatal("no snapshot chunks streamed")
+	}
+	if !stream.chunks[len(stream.chunks)-1].IsLast {
+		t.Error("final chunk is not marked IsLast")
+	}
+	snapshotLSN := stream.chunks[0].SnapshotLsn
+
+	// Reassemble the image and prove it is a database with a synced freelist.
+	var img []byte
+	for _, c := range stream.chunks {
+		if c.SnapshotLsn != snapshotLSN {
+			t.Errorf("chunk carries a different snapshot LSN: %d vs %d", c.SnapshotLsn, snapshotLSN)
+		}
+		img = append(img, c.Data...)
+	}
+	dst := filepath.Join(t.TempDir(), "snapshot.db")
+	if err := os.WriteFile(dst, img, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := bboltMetaFreelist(t, dst); got == pgidNoFreelist {
+		t.Error("streamed snapshot carries no freelist — the follower would rebuild it on every open")
+	}
+	if err := verifyDatabase(dst); err != nil {
+		t.Fatalf("streamed snapshot is not a usable database: %v", err)
+	}
+	// And the surviving half of the keyspace is in it.
+	db, err := bolt.Open(dst, 0o600, &bolt.Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	_ = db.View(func(tx *bolt.Tx) error {
+		if got := tx.Bucket([]byte("docs")).Stats().KeyN; got != 100 {
+			t.Errorf("snapshot holds %d docs keys, want 100", got)
+		}
+		return nil
+	})
 }
 
 // TestRequestSnapshot_Unauthenticated verifies the handler refuses an anonymous

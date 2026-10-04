@@ -279,6 +279,66 @@ func TestAFileThatIsNotADatabaseFailsTheCheck(t *testing.T) {
 	}
 }
 
+// bboltMetaFreelist reads the freelist page id out of the file's newest
+// valid meta page. Meta layout inside each meta page: 16-byte page header,
+// then magic(4) version(4) pageSize(4) flags(4) root{root,seq}(16)
+// freelist(8) pgid(8) txid(8) checksum(8).
+func bboltMetaFreelist(t *testing.T, path string) uint64 {
+	t.Helper()
+	data, err := os.ReadFile(path) //nolint:gosec // G304: a file this test created
+	if err != nil {
+		t.Fatal(err)
+	}
+	pageSize := int(binary.LittleEndian.Uint32(data[16+8:]))
+	const (
+		boltMagic       = 0xED0CDAED
+		pgidNoFreelist  = 0xFFFFFFFFFFFFFFFF
+		offMetaFreelist = 16 + 32 // page header + magic..root
+		offMetaTxid     = 16 + 48
+	)
+	found := false
+	var txid, freelist uint64
+	for pg := 0; pg <= 1; pg++ {
+		base := pg * pageSize
+		if base+offMetaTxid+8 > len(data) {
+			continue
+		}
+		if binary.LittleEndian.Uint32(data[base+16:]) != boltMagic {
+			continue
+		}
+		tid := binary.LittleEndian.Uint64(data[base+offMetaTxid:])
+		if !found || tid > txid {
+			found, txid = true, tid
+			freelist = binary.LittleEndian.Uint64(data[base+offMetaFreelist:])
+		}
+	}
+	if !found {
+		t.Fatal("no valid meta page found")
+	}
+	return freelist
+}
+
+const pgidNoFreelist = 0xFFFFFFFFFFFFFFFF
+
+func TestPersistFreelistWritesAFreelistIntoTheFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "unsynced.db")
+	writeTestDB(t, path, 500) // opened with NoFreelistSync: no freelist in file
+	if got := bboltMetaFreelist(t, path); got != pgidNoFreelist {
+		t.Fatalf("fresh NoFreelistSync database already carries a freelist: %#x", got)
+	}
+
+	if err := persistFreelist(path); err != nil {
+		t.Fatalf("persistFreelist: %v", err)
+	}
+	if got := bboltMetaFreelist(t, path); got == pgidNoFreelist {
+		t.Error("persistFreelist left the file without a synced freelist")
+	}
+	// The file is still an intact database.
+	if err := verifyDatabase(path); err != nil {
+		t.Fatalf("database fails the check after persistFreelist: %v", err)
+	}
+}
+
 func TestFailureReasonPrefersBboltsWords(t *testing.T) {
 	if got := failureReason("goroutine 1\npanic: freepages: page 4: multiple references\nstack"); got != "freepages: page 4: multiple references" {
 		t.Errorf("panic output: %q", got)
