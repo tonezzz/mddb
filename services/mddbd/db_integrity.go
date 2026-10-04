@@ -92,10 +92,20 @@ func runVerifyChildProcess(path string, openOnly bool) error {
 
 	// #nosec G204 -- runs this binary, with the path passed in the environment
 	cmd := exec.CommandContext(ctx, exe)
-	cmd.Env = append(os.Environ(), verifyChildEnv+"="+path)
-	if openOnly {
-		cmd.Env = append(cmd.Env, verifyOpenOnlyEnv+"=1")
+	// The check-mode variables are scrubbed and set explicitly — an inherited
+	// MDDB_INTERNAL_VERIFY_* must not leak a mode the caller never asked for.
+	envs := make([]string, 0, len(os.Environ())+2)
+	for _, e := range os.Environ() {
+		if strings.HasPrefix(e, verifyChildEnv+"=") || strings.HasPrefix(e, verifyOpenOnlyEnv+"=") {
+			continue
+		}
+		envs = append(envs, e)
 	}
+	envs = append(envs, verifyChildEnv+"="+path)
+	if openOnly {
+		envs = append(envs, verifyOpenOnlyEnv+"=1")
+	}
+	cmd.Env = envs
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
