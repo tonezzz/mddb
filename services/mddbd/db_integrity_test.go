@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -276,6 +277,153 @@ func TestAFileThatIsNotADatabaseFailsTheCheck(t *testing.T) {
 	}
 	if code := runVerifyChild(filepath.Join(t.TempDir(), "missing.db")); code != 1 {
 		t.Errorf("checking a missing file exited %d, want 1", code)
+	}
+}
+
+// bboltMetaFreelist reads the freelist page id out of the file's newest
+// valid meta page. Meta layout inside each meta page: 16-byte page header,
+// then magic(4) version(4) pageSize(4) flags(4) root{root,seq}(16)
+// freelist(8) pgid(8) txid(8) checksum(8).
+func bboltMetaFreelist(t *testing.T, path string) uint64 {
+	t.Helper()
+	data, err := os.ReadFile(path) //nolint:gosec // G304: a file this test created
+	if err != nil {
+		t.Fatal(err)
+	}
+	pageSize := int(binary.LittleEndian.Uint32(data[16+8:]))
+	const (
+		boltMagic       = 0xED0CDAED
+		pgidNoFreelist  = 0xFFFFFFFFFFFFFFFF
+		offMetaFreelist = 16 + 32 // page header + magic..root
+		offMetaTxid     = 16 + 48
+	)
+	found := false
+	var txid, freelist uint64
+	for pg := 0; pg <= 1; pg++ {
+		base := pg * pageSize
+		if base+offMetaTxid+8 > len(data) {
+			continue
+		}
+		if binary.LittleEndian.Uint32(data[base+16:]) != boltMagic {
+			continue
+		}
+		tid := binary.LittleEndian.Uint64(data[base+offMetaTxid:])
+		if !found || tid > txid {
+			found, txid = true, tid
+			freelist = binary.LittleEndian.Uint64(data[base+offMetaFreelist:])
+		}
+	}
+	if !found {
+		t.Fatal("no valid meta page found")
+	}
+	return freelist
+}
+
+const pgidNoFreelist = 0xFFFFFFFFFFFFFFFF
+
+func TestPersistFreelistWritesAFreelistIntoTheFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "unsynced.db")
+	writeTestDB(t, path, 500) // opened with NoFreelistSync: no freelist in file
+	if got := bboltMetaFreelist(t, path); got != pgidNoFreelist {
+		t.Fatalf("fresh NoFreelistSync database already carries a freelist: %#x", got)
+	}
+
+	if err := persistFreelist(path); err != nil {
+		t.Fatalf("persistFreelist: %v", err)
+	}
+	if got := bboltMetaFreelist(t, path); got == pgidNoFreelist {
+		t.Error("persistFreelist left the file without a synced freelist")
+	}
+	// The file is still an intact database.
+	if err := verifyDatabase(path); err != nil {
+		t.Fatalf("database fails the check after persistFreelist: %v", err)
+	}
+}
+
+// The open-only proof a trusted snapshot gets: a usable database passes, a
+// file that is not a database still fails, and — because the child performs
+// the same freelist walk a real open does — a damaged page tree is still
+// contained in the child rather than in the reopen.
+func TestVerifySnapshotProvesTheFileOpens(t *testing.T) {
+	good := filepath.Join(t.TempDir(), "ok.db")
+	writeTestDB(t, good, 500)
+	if err := verifySnapshot(good); err != nil {
+		t.Fatalf("a healthy database failed the snapshot check: %v", err)
+	}
+
+	text := filepath.Join(t.TempDir(), "text.db")
+	if err := os.WriteFile(text, []byte(strings.Repeat("not a database ", 1000)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifySnapshot(text); err == nil {
+		t.Error("a text file passed the snapshot check")
+	}
+	if err := verifySnapshot(filepath.Join(t.TempDir(), "missing.db")); err == nil {
+		t.Error("a missing file passed the snapshot check")
+	}
+}
+
+func TestVerifySnapshotStillCatchesThePanicClass(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bad.db")
+	writeTestDB(t, path, 5000)
+	corruptBranchPage(t, path)
+	// The unsynced file has no freelist, so the child's open walks the page
+	// tree — and the damaged tree still fails there, without tx.Check().
+	if err := verifySnapshot(path); err == nil {
+		t.Error("a damaged database passed the snapshot check")
+	}
+}
+
+// swapDatabaseVerified must honour the verifier it is given — a refused
+// source is rejected before the live database is touched.
+func TestSwapDatabaseHonoursItsVerifier(t *testing.T) {
+	s, cleanup := newHandlerTestServer(t)
+	defer cleanup()
+	addTestDoc(t, s, "blog", "kept", "en", "# still here", nil)
+
+	source := filepath.Join(t.TempDir(), "good.db")
+	writeTestDB(t, source, 100)
+
+	installed := false
+	err := s.withRestoreLock(func() error {
+		return s.swapDatabaseVerified(source, func(dst string) error {
+			installed = true
+			return copyFile(source, dst)
+		}, func(string) error { return fmt.Errorf("refused by verifier") })
+	})
+	if err == nil || !strings.Contains(err.Error(), "not a usable database") {
+		t.Fatalf("swapDatabaseVerified with a refusing verifier: %v", err)
+	}
+	if installed {
+		t.Error("install ran for a source the verifier refused")
+	}
+	if got := countDocs(t, s, "blog"); got != 1 {
+		t.Errorf("the server no longer serves its documents: %d", got)
+	}
+}
+
+// The child-progress figures come from /proc: a live pid yields cpu/read
+// figures, a dead or bogus one yields none (and the parent logs elapsed only).
+func TestVerifyProgressReadsProc(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("/proc is Linux-only")
+	}
+	if got := verifyProgress(os.Getpid(), 1024*1024); !strings.Contains(got, "cpu=") {
+		t.Errorf("expected cpu figure for a live pid, got %q", got)
+	}
+	if got := verifyProgress(-1, 1024*1024); got != "" {
+		t.Errorf("a bogus pid should give no figures, got %q", got)
+	}
+}
+
+func TestWithWalkProgressRunsAndReports(t *testing.T) {
+	ran := false
+	if err := withWalkProgress("test walk", nil, func() error { ran = true; return nil }); err != nil || !ran {
+		t.Errorf("withWalkProgress err=%v ran=%v", err, ran)
+	}
+	want := fmt.Errorf("walk failed")
+	if err := withWalkProgress("test walk", nil, func() error { return want }); err != want {
+		t.Errorf("withWalkProgress should return fn's error, got %v", err)
 	}
 }
 

@@ -51,6 +51,20 @@ func (s *Server) handleReplicationStatus(w http.ResponseWriter, r *http.Request)
 		resp.BinlogSize = stats.FileSize
 	}
 
+	// Follower: healthy must reflect replication state — a fresh follower
+	// reports healthy:true while sitting at LSN 0 otherwise.
+	if s.ReplicationRole == "follower" {
+		if rc := s.replClient; rc != nil {
+			resp.LeaderAddr = rc.leaderAddr
+			resp.CurrentLSN = rc.LastAppliedLSN()
+			resp.ReplicationLag = rc.LagMs()
+			resp.Healthy = rc.IsHealthy()
+		} else {
+			// Configured as a follower with no client running.
+			resp.Healthy = false
+		}
+	}
+
 	// Leader: list connected followers from ReplicationServer
 	if s.ReplicationRole == "leader" && s.Binlog != nil {
 		// We need access to the replication server's follower state.

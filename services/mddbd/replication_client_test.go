@@ -161,21 +161,38 @@ func TestReplicationClientIsHealthy(t *testing.T) {
 		MaxLag:     30 * time.Second,
 	})
 
-	// Never applied: unhealthy
+	// Not streaming from the leader: unhealthy no matter what else holds.
+	rc.applier.SetLastAppliedLSN(42)
 	if rc.IsHealthy() {
-		t.Error("expected unhealthy when nothing applied")
+		t.Error("expected unhealthy while no leader stream is established")
 	}
 
-	// Applied recently: healthy
-	rc.lastAppliedAt.Store(time.Now().Unix())
+	// Streaming but still at LSN 0 — a fresh follower waiting on its first
+	// snapshot is not caught up.
+	rc.connected.Store(true)
+	rc.applier.SetLastAppliedLSN(0)
+	if rc.IsHealthy() {
+		t.Error("expected unhealthy at LSN 0")
+	}
+
+	// Streaming, synced, lag inside the bound: healthy.
+	rc.applier.SetLastAppliedLSN(42)
+	rc.lagMs.Store(0)
 	if !rc.IsHealthy() {
-		t.Error("expected healthy after recent apply")
+		t.Error("expected healthy when connected, synced and inside maxLag")
 	}
 
-	// Applied long ago: unhealthy
-	rc.lastAppliedAt.Store(time.Now().Add(-1 * time.Minute).Unix())
+	// An idle-but-caught-up follower is still healthy — nothing arriving is
+	// not lag.
+	rc.lastAppliedAt.Store(time.Now().Add(-2 * time.Hour).Unix())
+	if !rc.IsHealthy() {
+		t.Error("expected healthy for a caught-up follower on an idle leader")
+	}
+
+	// Lag beyond the threshold: unhealthy.
+	rc.lagMs.Store(60_000)
 	if rc.IsHealthy() {
-		t.Error("expected unhealthy when last applied > maxLag ago")
+		t.Error("expected unhealthy when lag exceeds maxLag")
 	}
 }
 

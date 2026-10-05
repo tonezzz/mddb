@@ -79,8 +79,9 @@ MDDB_GRPC_PORT=11034 \
 The follower:
 - Automatically switches to **read-only mode**
 - Connects to the leader's gRPC port
-- Downloads a full snapshot (if starting fresh). The snapshot must pass
-  bbolt's full integrity check before it replaces the follower's database
+- Downloads a full snapshot (if starting fresh). The snapshot must prove
+  openable in a checker child process — the same freelist walk a real open
+  performs — before it replaces the follower's database
   ([BACKUP.md](BACKUP.md))
 - Tails the binlog for real-time updates
 
@@ -271,7 +272,7 @@ service MDDBReplication {
 
 | Method | Description |
 |--------|-------------|
-| `RequestSnapshot` | Full BoltDB snapshot streamed in 1MB chunks (uses `bolt.Tx.WriteTo()`) |
+| `RequestSnapshot` | Full BoltDB snapshot streamed in 1MB chunks; the leader copies the image to a temp file (`bolt.Tx.CopyFile()`), writes a freelist into it, then streams the file |
 | `StreamBinlog` | Historical entries from a given LSN + real-time tailing |
 | `ReplicationStatus` | Node role, LSN, lag, follower info |
 | `AcknowledgeLSN` | Follower confirms applied LSN (for retention) |
@@ -301,8 +302,8 @@ flowchart TD
 
 1. Follower connects with `StreamBinlog(fromLSN=0)`
 2. If leader responds with `FailedPrecondition` (LSN too old), follower requests full snapshot
-3. Leader streams BoltDB snapshot via `bolt.Tx.WriteTo()` in 1MB chunks (non-blocking read-only transaction)
-4. Follower saves to temp file, replaces local DB, reloads in-memory state
+3. Leader copies the database image to a temp file inside a short read-only transaction (`bolt.Tx.CopyFile()`), persists a bbolt freelist into the copy — so the follower never pays the O(every-page) freelist rebuild — and streams the file in 1MB chunks
+4. Follower saves to temp file, replaces local DB (open proof in a checker child process first), reloads in-memory state
 5. Follower resumes `StreamBinlog` from the snapshot's LSN
 
 ### Reconnection

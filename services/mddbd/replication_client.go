@@ -35,6 +35,7 @@ type ReplicationClient struct {
 	lastAppliedAt atomic.Int64
 	lagMs         atomic.Int64
 	running       atomic.Bool
+	connected     atomic.Bool // a leader stream is established
 	stopCh        chan struct{}
 	wg            sync.WaitGroup
 }
@@ -105,13 +106,25 @@ func (rc *ReplicationClient) LastAppliedAt() int64 {
 	return rc.lastAppliedAt.Load()
 }
 
-// IsHealthy returns true if the replication lag is within acceptable bounds
+// LastAppliedLSN returns the last binlog LSN applied to the local database —
+// the follower's position in the replication stream.
+func (rc *ReplicationClient) LastAppliedLSN() uint64 {
+	return rc.applier.LastAppliedLSN()
+}
+
+// IsHealthy reports whether replication is actually caught up: a leader
+// stream is established, the follower has applied something (a fresh
+// follower at LSN 0 is still waiting for its first snapshot), and the lag
+// estimate is within maxLag. Time since the last applied entry is NOT the
+// signal — a caught-up follower on an idle leader applies nothing for hours.
 func (rc *ReplicationClient) IsHealthy() bool {
-	lastApplied := rc.lastAppliedAt.Load()
-	if lastApplied == 0 {
-		return false // never applied anything
+	if !rc.connected.Load() {
+		return false
 	}
-	return time.Since(time.Unix(lastApplied, 0)) < rc.maxLag
+	if rc.applier.LastAppliedLSN() == 0 {
+		return false
+	}
+	return rc.lagMs.Load() <= rc.maxLag.Milliseconds()
 }
 
 // loop is the main replication loop with reconnection logic
@@ -156,6 +169,7 @@ func (rc *ReplicationClient) connect() error {
 
 // disconnect closes the gRPC connection
 func (rc *ReplicationClient) disconnect() {
+	rc.connected.Store(false)
 	if rc.conn != nil {
 		_ = rc.conn.Close()
 		rc.conn = nil
@@ -199,6 +213,7 @@ func (rc *ReplicationClient) replicate() error {
 		}
 		return err
 	}
+	rc.connected.Store(true)
 
 	// Start ack goroutine
 	go rc.ackLoop(ctx)
@@ -329,9 +344,14 @@ func (rc *ReplicationClient) requestSnapshot(ctx context.Context) error {
 // created and is about to delete, and copying a multi-gigabyte file to throw
 // the original away is waste.
 func (rc *ReplicationClient) replaceDatabase(snapshotPath string) error {
-	return rc.server.swapDatabase(snapshotPath, func(dst string) error {
+	// verifySnapshot, not verifyDatabase: the snapshot is trusted material
+	// that arrived complete over the stream (and was already opened on the
+	// leader), so the child proves it opens — freelist walk and panic class
+	// included — and skips the O(every-page) invariant check that used to
+	// time out at MDDB_VERIFY_TIMEOUT on large databases.
+	return rc.server.swapDatabaseVerified(snapshotPath, func(dst string) error {
 		return os.Rename(snapshotPath, dst)
-	})
+	}, verifySnapshot)
 }
 
 // ackLoop periodically sends LSN acknowledgments to the leader
