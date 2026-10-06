@@ -27,6 +27,7 @@ type recordingStream struct {
 	ctx    context.Context
 	mu     sync.Mutex
 	lsns   []uint64
+	protos []*proto.BinlogEntryProto
 	onSend func(n int)
 }
 
@@ -35,12 +36,19 @@ func (s *recordingStream) Context() context.Context { return s.ctx }
 func (s *recordingStream) Send(e *proto.BinlogEntryProto) error {
 	s.mu.Lock()
 	s.lsns = append(s.lsns, e.Lsn)
+	s.protos = append(s.protos, e)
 	n := len(s.lsns)
 	s.mu.Unlock()
 	if s.onSend != nil {
 		s.onSend(n)
 	}
 	return nil
+}
+
+func (s *recordingStream) sentProtos() []*proto.BinlogEntryProto {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]*proto.BinlogEntryProto(nil), s.protos...)
 }
 
 func (s *recordingStream) received() []uint64 {

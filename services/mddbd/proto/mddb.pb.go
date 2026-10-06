@@ -9094,14 +9094,19 @@ func (x *StreamBinlogRequest) GetFromLsn() uint64 {
 }
 
 type BinlogEntryProto struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Lsn           uint64                 `protobuf:"varint,1,opt,name=lsn,proto3" json:"lsn,omitempty"`
-	Type          uint32                 `protobuf:"varint,2,opt,name=type,proto3" json:"type,omitempty"`
-	Timestamp     int64                  `protobuf:"varint,3,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
-	BucketName    string                 `protobuf:"bytes,4,opt,name=bucket_name,json=bucketName,proto3" json:"bucket_name,omitempty"`
-	Key           []byte                 `protobuf:"bytes,5,opt,name=key,proto3" json:"key,omitempty"`
-	Value         []byte                 `protobuf:"bytes,6,opt,name=value,proto3" json:"value,omitempty"`
-	Checksum      uint32                 `protobuf:"varint,7,opt,name=checksum,proto3" json:"checksum,omitempty"`
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	Lsn        uint64                 `protobuf:"varint,1,opt,name=lsn,proto3" json:"lsn,omitempty"`
+	Type       uint32                 `protobuf:"varint,2,opt,name=type,proto3" json:"type,omitempty"`
+	Timestamp  int64                  `protobuf:"varint,3,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	BucketName string                 `protobuf:"bytes,4,opt,name=bucket_name,json=bucketName,proto3" json:"bucket_name,omitempty"`
+	Key        []byte                 `protobuf:"bytes,5,opt,name=key,proto3" json:"key,omitempty"`
+	Value      []byte                 `protobuf:"bytes,6,opt,name=value,proto3" json:"value,omitempty"`
+	Checksum   uint32                 `protobuf:"varint,7,opt,name=checksum,proto3" json:"checksum,omitempty"`
+	// heartbeat marks a liveness entry emitted by the leader when the binlog
+	// has been idle for the heartbeat interval. It carries no LSN and is
+	// never applied by the follower — it exists purely to keep the stream
+	// distinguishable from a frozen connection.
+	Heartbeat     bool `protobuf:"varint,8,opt,name=heartbeat,proto3" json:"heartbeat,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -9183,6 +9188,13 @@ func (x *BinlogEntryProto) GetChecksum() uint32 {
 		return x.Checksum
 	}
 	return 0
+}
+
+func (x *BinlogEntryProto) GetHeartbeat() bool {
+	if x != nil {
+		return x.Heartbeat
+	}
+	return false
 }
 
 type ReplicationStatusRequest struct {
@@ -9330,12 +9342,16 @@ func (x *ReplicationStatusResponse) GetBinlogSizeBytes() int64 {
 }
 
 type FollowerInfo struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	FollowerId    string                 `protobuf:"bytes,1,opt,name=follower_id,json=followerId,proto3" json:"follower_id,omitempty"`
-	ConfirmedLsn  uint64                 `protobuf:"varint,2,opt,name=confirmed_lsn,json=confirmedLsn,proto3" json:"confirmed_lsn,omitempty"`
-	LastSeenAt    int64                  `protobuf:"varint,3,opt,name=last_seen_at,json=lastSeenAt,proto3" json:"last_seen_at,omitempty"`
-	Address       string                 `protobuf:"bytes,4,opt,name=address,proto3" json:"address,omitempty"`
-	LagMs         int64                  `protobuf:"varint,5,opt,name=lag_ms,json=lagMs,proto3" json:"lag_ms,omitempty"`
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	FollowerId   string                 `protobuf:"bytes,1,opt,name=follower_id,json=followerId,proto3" json:"follower_id,omitempty"`
+	ConfirmedLsn uint64                 `protobuf:"varint,2,opt,name=confirmed_lsn,json=confirmedLsn,proto3" json:"confirmed_lsn,omitempty"`
+	LastSeenAt   int64                  `protobuf:"varint,3,opt,name=last_seen_at,json=lastSeenAt,proto3" json:"last_seen_at,omitempty"`
+	Address      string                 `protobuf:"bytes,4,opt,name=address,proto3" json:"address,omitempty"`
+	LagMs        int64                  `protobuf:"varint,5,opt,name=lag_ms,json=lagMs,proto3" json:"lag_ms,omitempty"`
+	// last_sent_at is the unix timestamp of the last entry or heartbeat the
+	// leader sent on this follower's stream. A frozen-but-connected stream
+	// shows a stale last_sent_at while the follower still appears connected.
+	LastSentAt    int64 `protobuf:"varint,6,opt,name=last_sent_at,json=lastSentAt,proto3" json:"last_sent_at,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -9401,6 +9417,13 @@ func (x *FollowerInfo) GetAddress() string {
 func (x *FollowerInfo) GetLagMs() int64 {
 	if x != nil {
 		return x.LagMs
+	}
+	return 0
+}
+
+func (x *FollowerInfo) GetLastSentAt() int64 {
+	if x != nil {
+		return x.LastSentAt
 	}
 	return 0
 }
@@ -12850,7 +12873,7 @@ const file_mddb_proto_rawDesc = "" +
 	"\x13StreamBinlogRequest\x12\x1f\n" +
 	"\vfollower_id\x18\x01 \x01(\tR\n" +
 	"followerId\x12\x19\n" +
-	"\bfrom_lsn\x18\x02 \x01(\x04R\afromLsn\"\xbb\x01\n" +
+	"\bfrom_lsn\x18\x02 \x01(\x04R\afromLsn\"\xd9\x01\n" +
 	"\x10BinlogEntryProto\x12\x10\n" +
 	"\x03lsn\x18\x01 \x01(\x04R\x03lsn\x12\x12\n" +
 	"\x04type\x18\x02 \x01(\rR\x04type\x12\x1c\n" +
@@ -12859,7 +12882,8 @@ const file_mddb_proto_rawDesc = "" +
 	"bucketName\x12\x10\n" +
 	"\x03key\x18\x05 \x01(\fR\x03key\x12\x14\n" +
 	"\x05value\x18\x06 \x01(\fR\x05value\x12\x1a\n" +
-	"\bchecksum\x18\a \x01(\rR\bchecksum\"\x1a\n" +
+	"\bchecksum\x18\a \x01(\rR\bchecksum\x12\x1c\n" +
+	"\theartbeat\x18\b \x01(\bR\theartbeat\"\x1a\n" +
 	"\x18ReplicationStatusRequest\"\xea\x02\n" +
 	"\x19ReplicationStatusResponse\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x12\n" +
@@ -12872,7 +12896,7 @@ const file_mddb_proto_rawDesc = "" +
 	"\tfollowers\x18\x06 \x03(\v2\x12.mddb.FollowerInfoR\tfollowers\x12,\n" +
 	"\x12replication_lag_ms\x18\a \x01(\x03R\x10replicationLagMs\x12*\n" +
 	"\x11binlog_oldest_lsn\x18\b \x01(\x04R\x0fbinlogOldestLsn\x12*\n" +
-	"\x11binlog_size_bytes\x18\t \x01(\x03R\x0fbinlogSizeBytes\"\xa7\x01\n" +
+	"\x11binlog_size_bytes\x18\t \x01(\x03R\x0fbinlogSizeBytes\"\xc9\x01\n" +
 	"\fFollowerInfo\x12\x1f\n" +
 	"\vfollower_id\x18\x01 \x01(\tR\n" +
 	"followerId\x12#\n" +
@@ -12880,7 +12904,9 @@ const file_mddb_proto_rawDesc = "" +
 	"\flast_seen_at\x18\x03 \x01(\x03R\n" +
 	"lastSeenAt\x12\x18\n" +
 	"\aaddress\x18\x04 \x01(\tR\aaddress\x12\x15\n" +
-	"\x06lag_ms\x18\x05 \x01(\x03R\x05lagMs\"]\n" +
+	"\x06lag_ms\x18\x05 \x01(\x03R\x05lagMs\x12 \n" +
+	"\flast_sent_at\x18\x06 \x01(\x03R\n" +
+	"lastSentAt\"]\n" +
 	"\x15AcknowledgeLSNRequest\x12\x1f\n" +
 	"\vfollower_id\x18\x01 \x01(\tR\n" +
 	"followerId\x12#\n" +

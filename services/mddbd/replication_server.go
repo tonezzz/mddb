@@ -84,6 +84,10 @@ type FollowerState struct {
 	ConfirmedLSN uint64
 	LastSeenAt   int64
 	Address      string
+	// LastSentAt is the unix time of the last entry or heartbeat the leader
+	// wrote on this follower's stream. Updated per send — an atomic so the
+	// stream goroutine does not need rs.mu on the hot path.
+	LastSentAt atomic.Int64
 }
 
 // NewReplicationServer creates a new replication server
@@ -190,6 +194,13 @@ func (rs *ReplicationServer) RequestSnapshot(req *proto.SnapshotRequest, stream 
 // sent everything the log holds.
 const replicationGapCheck = 500 * time.Millisecond
 
+// replicationHeartbeatInterval is how long a binlog stream may go without
+// sending anything before the leader emits a heartbeat entry. A heartbeat
+// carries no LSN and is never applied — it exists so a frozen-but-connected
+// stream (TCP alive, leader loop dead) is distinguishable from an idle one.
+// A var, not a const, so tests can shorten it.
+var replicationHeartbeatInterval = 15 * time.Second
+
 // StreamBinlog streams binlog entries from a given LSN. The stream stays open for continuous tailing.
 func (rs *ReplicationServer) StreamBinlog(req *proto.StreamBinlogRequest, stream proto.MDDBReplication_StreamBinlogServer) error {
 	if err := rs.authorizeReplication(stream.Context()); err != nil {
@@ -255,11 +266,14 @@ func (rs *ReplicationServer) StreamBinlog(req *proto.StreamBinlogRequest, stream
 	defer rs.server.Binlog.Unsubscribe(subID)
 
 	sent := fromLSN
+	lastSent := time.Now()
 	send := func(entry *binlog.BinlogEntry) error {
 		if err := stream.Send(entryToProto(entry)); err != nil {
 			return err
 		}
 		sent = entry.LSN
+		lastSent = time.Now()
+		state.LastSentAt.Store(lastSent.Unix())
 		return nil
 	}
 	catchUp := func() error {
@@ -290,6 +304,8 @@ func (rs *ReplicationServer) StreamBinlog(req *proto.StreamBinlogRequest, stream
 	// the log's current LSN.
 	idle := time.NewTicker(replicationGapCheck)
 	defer idle.Stop()
+	heartbeat := time.NewTicker(replicationHeartbeatInterval)
+	defer heartbeat.Stop()
 	for {
 		select {
 		case <-idle.C:
@@ -298,6 +314,23 @@ func (rs *ReplicationServer) StreamBinlog(req *proto.StreamBinlogRequest, stream
 					return err
 				}
 			}
+		case <-heartbeat.C:
+			// Liveness entry on an idle stream. It deliberately carries
+			// lsn=0/type=0/empty bucket: it never touches `sent`, never
+			// reaches the binlog, and a follower running a pre-heartbeat
+			// build fails it in CreateBucketIfNotExists before the LSN
+			// marker write — warn log, no LSN pollution, no snapshot reset.
+			if time.Since(lastSent) < replicationHeartbeatInterval {
+				continue
+			}
+			if err := stream.Send(&proto.BinlogEntryProto{
+				Heartbeat: true,
+				Timestamp: time.Now().UnixNano(),
+			}); err != nil {
+				return err
+			}
+			lastSent = time.Now()
+			state.LastSentAt.Store(lastSent.Unix())
 		case entry, ok := <-ch:
 			if !ok {
 				return nil // channel closed (binlog shutting down)
@@ -352,6 +385,7 @@ func (rs *ReplicationServer) ReplicationStatus(_ context.Context, _ *proto.Repli
 			LastSeenAt:   fs.LastSeenAt,
 			Address:      fs.Address,
 			LagMs:        lagMs,
+			LastSentAt:   fs.LastSentAt.Load(),
 		})
 	}
 	rs.mu.RUnlock()
