@@ -325,6 +325,15 @@ func (rc *ReplicationClient) requestSnapshot(ctx context.Context) error {
 	rc.applier.SetLastAppliedLSN(snapshotLSN)
 	rc.lastAppliedAt.Store(time.Now().Unix())
 
+	// The swapped-in database carries no LSN marker — it is a copy of the
+	// leader's file, which never writes one. Persist the snapshot LSN so a
+	// restart tails the binlog instead of re-snapshotting. Non-fatal: the
+	// in-memory LSN still drives this session, and the first applied entry
+	// writes the marker anyway.
+	if err := rc.applier.PersistLSN(snapshotLSN); err != nil {
+		slog.Warn("replication could not persist snapshot LSN marker", "snapshotLSN", snapshotLSN, "err", err)
+	}
+
 	slog.Info("replication snapshot applied", "snapshotLSN", snapshotLSN)
 	return nil
 }

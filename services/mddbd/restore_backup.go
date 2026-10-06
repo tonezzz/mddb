@@ -49,6 +49,14 @@ func (s *Server) restoreFromBackup(safeFrom string) error {
 			slog.Warn("failed to reset binlog after restore", "err", err)
 		}
 	}
+
+	// On a follower the restored file also replaced the replicated state the
+	// applier tracks: its persisted LSN marker is whatever the backup held
+	// (often none). Re-read it so the stream resumes from the restored
+	// position — replay if the marker is older, re-snapshot if absent.
+	if s.replClient != nil && s.replClient.applier != nil {
+		s.replClient.applier.ReloadPersistedLSN()
+	}
 	return nil
 }
 
