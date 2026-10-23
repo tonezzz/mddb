@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`GET /v1/stats` walked every key in `docs`, `rev` and `idxmeta` on every
+  request**, then opened one more read transaction per collection for the
+  crc32 checksum (57 extra transactions on a 57-collection database). On
+  multi-GB databases the endpoint ran anywhere from ~1s warm to >60s under
+  load, pinning a long bbolt read transaction and starving sibling requests
+  (concurrent `/metrics` and `/v1/vector-stats` timed out). The per-collection
+  counters and checksums are now computed in a single pass over the three
+  buckets — the checksum folds into the same `docs` walk and produces
+  byte-identical values — and the resulting snapshot is cached for 60s:
+  at most one walk is in flight, requests are served the previous snapshot
+  while a refresh runs, and `?refresh=1` forces a synchronous recompute.
+  Tenant filtering, collection attributes, database size and index-queue
+  stats are still evaluated per request.
+
 ## [2.15.4] - 2026-10-02
 
 Four production bug reports (#266, #267, #269, #270) and the bugs of the same

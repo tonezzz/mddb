@@ -151,6 +151,11 @@ type Server struct {
 	replClient      *ReplicationClient // Follower-side replication client
 	// Readiness
 	Ready bool // Set to true after full initialization; health check returns "warming_up" until then
+	// statsCache memoizes the O(total keys) bucket walk behind /v1/stats
+	// (stats_cache.go): a single bbolt read tx scanned every docs/rev/idxmeta
+	// key per request, which on multi-GB databases took >60s under load and
+	// starved sibling requests. Recomputed at most once per TTL, single-flight.
+	statsCache statsCache
 }
 
 // BucketNames caches bucket name byte slices to avoid repeated allocations
