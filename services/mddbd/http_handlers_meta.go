@@ -342,18 +342,6 @@ func (s *Server) handleMetaKeys(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
-	type CollectionStats struct {
-		Name           string `json:"name"`
-		DocumentCount  int    `json:"documentCount"`
-		RevisionCount  int    `json:"revisionCount"`
-		MetaIndexCount int    `json:"metaIndexCount"`
-		Checksum       string `json:"checksum"`
-		Type           string `json:"type,omitempty"`
-		Description    string `json:"description,omitempty"`
-		Icon           string `json:"icon,omitempty"`
-		Color          string `json:"color,omitempty"`
-	}
-
 	// Check read permission (database-wide stats)
 	if s.AuthManager != nil {
 		if err := s.AuthManager.CheckPermission(r.Context(), "*", PermRead); err != nil {
@@ -384,6 +372,23 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		Uptime           string            `json:"uptime"`
 	}
 
+	// The per-collection counters + checksums come from a cached snapshot
+	// (stats_cache.go): the bucket walk is O(total keys) in one bbolt read tx,
+	// so it recomputes at most once per statsCacheTTL with a single flight —
+	// stale snapshots are served while a refresh runs. ?refresh=1 forces a
+	// synchronous recompute for callers that need right-now numbers.
+	var collectionMap map[string]*CollectionStats
+	var err error
+	if r.URL.Query().Get("refresh") != "" {
+		collectionMap, err = s.statsCache.refresh(s)
+	} else {
+		collectionMap, err = s.statsCache.snapshot(s)
+	}
+	if err != nil {
+		bad(w, err)
+		return
+	}
+
 	stats := Stats{
 		DatabasePath: s.Path,
 		Mode:         string(s.Mode),
@@ -391,98 +396,33 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get database file size
-	if info, err := os.Stat(s.Path); err == nil {
+	if info, statErr := os.Stat(s.Path); statErr == nil {
 		stats.DatabaseSize = info.Size()
 	}
 
-	// Collect statistics per collection. Tenant users only see (and count)
-	// collections inside their namespace.
+	// Tenant users only see (and count) collections inside their namespace;
+	// the snapshot is global and the filter is applied per request.
 	tenant := TenantFromContext(r.Context())
-	collectionMap := make(map[string]*CollectionStats)
-
-	err := s.DBView(func(tx *bolt.Tx) error {
-		// Count documents per collection
-		bDocs := tx.Bucket([]byte("docs"))
-		if bDocs != nil {
-			c := bDocs.Cursor()
-			for k, _ := c.First(); k != nil; k, _ = c.Next() {
-				// key format: doc|collection|id
-				parts := strings.Split(string(k), "|")
-				if len(parts) >= 2 && CollectionInTenant(tenant, parts[1]) {
-					coll := parts[1]
-					if _, ok := collectionMap[coll]; !ok {
-						collectionMap[coll] = &CollectionStats{Name: coll}
-					}
-					collectionMap[coll].DocumentCount++
-					stats.TotalDocuments++
-				}
-			}
-		}
-
-		// Count revisions per collection
-		bRev := tx.Bucket([]byte("rev"))
-		if bRev != nil {
-			c := bRev.Cursor()
-			for k, _ := c.First(); k != nil; k, _ = c.Next() {
-				// key format: rev|collection|docID|ts
-				parts := strings.Split(string(k), "|")
-				if len(parts) >= 2 && CollectionInTenant(tenant, parts[1]) {
-					coll := parts[1]
-					if _, ok := collectionMap[coll]; !ok {
-						collectionMap[coll] = &CollectionStats{Name: coll}
-					}
-					collectionMap[coll].RevisionCount++
-					stats.TotalRevisions++
-				}
-			}
-		}
-
-		// Count meta indices per collection
-		bIdx := tx.Bucket([]byte("idxmeta"))
-		if bIdx != nil {
-			c := bIdx.Cursor()
-			for k, _ := c.First(); k != nil; k, _ = c.Next() {
-				// key format: meta|collection|key|value|docID
-				parts := strings.Split(string(k), "|")
-				if len(parts) >= 2 && CollectionInTenant(tenant, parts[1]) {
-					coll := parts[1]
-					if _, ok := collectionMap[coll]; !ok {
-						collectionMap[coll] = &CollectionStats{Name: coll}
-					}
-					collectionMap[coll].MetaIndexCount++
-					stats.TotalMetaIndices++
-				}
-			}
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		bad(w, err)
-		return
-	}
-
-	// Compute checksums per collection
 	for name, cs := range collectionMap {
-		cs.Checksum, _ = s.collectionChecksum(name)
-	}
+		if !CollectionInTenant(tenant, name) {
+			continue
+		}
+		stats.TotalDocuments += cs.DocumentCount
+		stats.TotalRevisions += cs.RevisionCount
+		stats.TotalMetaIndices += cs.MetaIndexCount
 
-	// Enrich with collection config attributes
-	if s.CollectionManager != nil {
-		for name, cs := range collectionMap {
+		// Copy: Type/Description/Icon/Color are per-request enrichment and the
+		// cached entry must stay untouched.
+		out := *cs
+		if s.CollectionManager != nil {
 			if cfg, ok := s.CollectionManager.Get(name); ok {
-				cs.Type = cfg.Type
-				cs.Description = cfg.Description
-				cs.Icon = cfg.Icon
-				cs.Color = cfg.Color
+				out.Type = cfg.Type
+				out.Description = cfg.Description
+				out.Icon = cfg.Icon
+				out.Color = cfg.Color
 			}
 		}
-	}
-
-	// Convert map to slice
-	for _, cs := range collectionMap {
-		stats.Collections = append(stats.Collections, *cs)
+		stats.Collections = append(stats.Collections, out)
 	}
 
 	// Sort collections by name
