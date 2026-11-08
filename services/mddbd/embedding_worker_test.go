@@ -421,3 +421,69 @@ func TestAnUnparseableWaitFallsBackToTheDefault(t *testing.T) {
 		t.Errorf("wait = %v, want 250ms", got)
 	}
 }
+
+func TestEmbedBreakerTripsAfterThreshold(t *testing.T) {
+	b := &embedBreaker{threshold: 3, base: 10 * time.Millisecond, max: 40 * time.Millisecond}
+	for i := 0; i < 3; i++ {
+		if b.deadline().After(time.Now()) {
+			t.Fatalf("circuit opened early at fail %d", i+1)
+		}
+		b.fail()
+	}
+	if !b.deadline().After(time.Now()) {
+		t.Fatal("circuit did not open at threshold")
+	}
+	// re-trip while tripped is immediate — a half-open failure doubles
+	// the backoff without needing the threshold again
+	b.consecutive.Store(0)
+	b.fail()
+	if bo := time.Duration(b.backoff.Load()); bo != 20*time.Millisecond {
+		t.Fatalf("backoff after re-trip = %v, want 20ms", bo)
+	}
+	b.succeed()
+	if b.consecutive.Load() != 0 || b.backoff.Load() != 0 {
+		t.Fatal("succeed did not reset the breaker")
+	}
+}
+
+func TestEmbedBreakerBackoffCapsAtMax(t *testing.T) {
+	b := &embedBreaker{threshold: 1, base: 10 * time.Millisecond, max: 15 * time.Millisecond}
+	b.fail() // trips at base
+	b.fail() // re-trip: 20ms > max -> clamped
+	if bo := time.Duration(b.backoff.Load()); bo != 15*time.Millisecond {
+		t.Fatalf("backoff = %v, want capped 15ms", bo)
+	}
+}
+
+func TestEmbeddingWorker_BreakerPausesDuringOutage(t *testing.T) {
+	t.Setenv("MDDB_EMBEDDING_BREAKER_THRESHOLD", "1")
+	t.Setenv("MDDB_EMBEDDING_BREAKER_BASE", "1s")
+	t.Setenv("MDDB_EMBEDDING_BREAKER_MAX", "2s")
+	_, vs, vi := embWorkerSetup(t)
+	provider := &embWorkerMockProvider{
+		model:     "test-model",
+		dims:      3,
+		vector:    []float32{0.1, 0.2, 0.3},
+		failUntil: 1 << 30, // provider dead for the whole test
+	}
+	w := NewEmbeddingWorker(provider, vs, vi, 10)
+	w.Start(1)
+	defer w.Stop()
+
+	// a dead provider trips the circuit after `threshold` failures;
+	// the worker then waits the cooldown instead of burning retries
+	for i := 0; i < 6; i++ {
+		w.Enqueue(EmbeddingJob{
+			Collection: "test-col",
+			DocID:      fmt.Sprintf("doc-%d", i),
+			ContentMD:  "text",
+		})
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !w.breaker.deadline().After(time.Now()) {
+		if time.Now().After(deadline) {
+			t.Fatal("breaker never opened under sustained failure")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
