@@ -24,6 +24,10 @@ type EmbeddingJob struct {
 	// disagree, chunk 3 at read time is not chunk 3 at write time and every
 	// passage is wrong.
 	ChunkMode ChunkMode
+	// Attempts counts processings that ended in a provider error, including
+	// outage recirculations — it bounds a job's total life so a document
+	// the provider always rejects cannot recirculate forever.
+	Attempts int
 }
 
 // EmbeddingWorker processes embedding jobs asynchronously.
@@ -53,6 +57,18 @@ type EmbeddingWorker struct {
 	// /v1/vector-stats — is what makes "1,002 of 4,000 embedded" a state
 	// rather than a mystery.
 	dropped atomic.Uint64
+
+	// retried counts jobs handed back to the queue after a provider error
+	// (2026-11-12: before retry existed, a failed job was abandoned silently
+	// — the doc lost its vector with no trace until a full reindex).
+	retried atomic.Uint64
+
+	// maxJobAttempts bounds a job's total life: every failed processing
+	// requeues it (provider outage included — the document is not at fault
+	// during an outage and must survive it), but past this budget it drops
+	// so a permanently-poisoned document cannot hold the breaker open
+	// forever while hiding behind free recirculation.
+	maxJobAttempts int
 
 	// indexer receives every chunk the worker embeds, and drops the chunks a
 	// shrunken document no longer has. The server sets it to all of its
@@ -92,16 +108,17 @@ func (w *EmbeddingWorker) SetIndexer(ix chunkIndexer) {
 // NewEmbeddingWorker creates a new background embedding worker.
 func NewEmbeddingWorker(provider embedding.Provider, store *vec.VectorStore, index *vec.VectorIndex, bufferSize int) *EmbeddingWorker {
 	return &EmbeddingWorker{
-		provider:     provider,
-		vectorStore:  store,
-		vectorIndex:  index,
-		jobs:         make(chan EmbeddingJob, bufferSize),
-		stopCh:       make(chan struct{}),
-		chunkSize:    envconf.Int("MDDB_EMBEDDING_CHUNK_SIZE", 1500),
-		chunkEnabled: envconf.String("MDDB_EMBEDDING_CHUNK_ENABLED", "true") == "true",
-		enqueueWait:  embeddingEnqueueWait(),
-		indexer:      flatIndexer{index},
-		breaker:      newEmbedBreaker(),
+		provider:       provider,
+		vectorStore:    store,
+		vectorIndex:    index,
+		jobs:           make(chan EmbeddingJob, bufferSize),
+		stopCh:         make(chan struct{}),
+		chunkSize:      envconf.Int("MDDB_EMBEDDING_CHUNK_SIZE", 1500),
+		chunkEnabled:   envconf.String("MDDB_EMBEDDING_CHUNK_ENABLED", "true") == "true",
+		enqueueWait:    embeddingEnqueueWait(),
+		indexer:        flatIndexer{index},
+		breaker:        newEmbedBreaker(),
+		maxJobAttempts: maxEmbeddingJobAttempts(),
 	}
 }
 
@@ -140,8 +157,21 @@ func embeddingEnqueueWait() time.Duration {
 }
 
 // QueueStats reports what the queue is holding and what it has lost.
-func (w *EmbeddingWorker) QueueStats() (size, depth int, dropped uint64, wait time.Duration) {
-	return cap(w.jobs), len(w.jobs), w.dropped.Load(), w.enqueueWait
+func (w *EmbeddingWorker) QueueStats() (size, depth int, dropped, retried uint64, wait time.Duration) {
+	return cap(w.jobs), len(w.jobs), w.dropped.Load(), w.retried.Load(), w.enqueueWait
+}
+
+// maxEmbeddingJobAttempts is how many failed processings a job survives
+// before it is dropped. The default is generous — at the breaker's max
+// 10-minute cooldown it covers roughly an eight-hour provider outage —
+// while still bounded so a permanently rejected document dies instead of
+// recirculating forever and holding the breaker open.
+func maxEmbeddingJobAttempts() int {
+	n := envconf.Int("MDDB_EMBEDDING_JOB_MAX_ATTEMPTS", 50)
+	if n < 1 {
+		n = 1
+	}
+	return n
 }
 
 // embedBreaker is a provider-outage circuit breaker for the whole
@@ -289,6 +319,23 @@ func (w *EmbeddingWorker) Enqueue(job EmbeddingJob) bool {
 	return w.dropJob(job)
 }
 
+// requeue hands a failed job back to the tail of the queue without
+// waiting — a retried job must never block a worker behind fresh writes,
+// and when the queue is full the retried job drops first so new documents
+// always win the last slot.
+func (w *EmbeddingWorker) requeue(job EmbeddingJob) bool {
+	select {
+	case w.jobs <- job:
+		w.retried.Add(1)
+		if w.metrics != nil {
+			w.metrics.IncOp("embedding", "retried")
+		}
+		return true
+	default:
+		return w.dropJob(job)
+	}
+}
+
 // dropJob records an abandoned job and always reports failure.
 func (w *EmbeddingWorker) dropJob(job EmbeddingJob) bool {
 	w.dropped.Add(1)
@@ -395,7 +442,18 @@ func (w *EmbeddingWorker) processJob(job EmbeddingJob) {
 		}
 
 		if embedErr != nil {
-			slog.Error("embedding failed after all attempts", "collection", job.Collection, "docID", job.DocID, "i", i, "err", embedErr)
+			job.Attempts++
+			if job.Attempts < w.maxJobAttempts {
+				slog.Warn("embedding failed, requeueing job",
+					"collection", job.Collection, "docID", job.DocID, "i", i,
+					"attempts", job.Attempts, "maxAttempts", w.maxJobAttempts, "err", embedErr)
+				w.requeue(job)
+			} else {
+				slog.Error("embedding job dropped after max attempts — document will have no vector until reindexed",
+					"collection", job.Collection, "docID", job.DocID,
+					"attempts", job.Attempts, "err", embedErr)
+				w.dropJob(job)
+			}
 			if w.metrics != nil {
 				w.metrics.IncOp("embedding", "error")
 			}

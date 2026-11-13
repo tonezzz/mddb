@@ -362,7 +362,7 @@ func TestAFullQueueWaitsForRoomInsteadOfDroppingTheJob(t *testing.T) {
 	}
 	w.Stop()
 
-	if _, _, dropped, _ := w.QueueStats(); dropped != 0 {
+	if _, _, dropped, _, _ := w.QueueStats(); dropped != 0 {
 		t.Errorf("dropped = %d, want 0 — nothing was lost here", dropped)
 	}
 }
@@ -381,7 +381,7 @@ func TestAbandonedJobsAreCounted(t *testing.T) {
 		}
 	}
 
-	size, depth, dropped, wait := w.QueueStats()
+	size, depth, dropped, _, wait := w.QueueStats()
 	if dropped != 3 {
 		t.Errorf("dropped = %d, want 3 — the count is what makes the loss visible", dropped)
 	}
@@ -485,5 +485,66 @@ func TestEmbeddingWorker_BreakerPausesDuringOutage(t *testing.T) {
 			t.Fatal("breaker never opened under sustained failure")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestEmbeddingWorker_RetryThenSucceeds(t *testing.T) {
+	_, vs, vi := embWorkerSetup(t)
+	// failUntil covers all three in-chunk attempts of the first
+	// processing — the job must come back via the requeue path, not the
+	// in-chunk retry loop.
+	provider := &embWorkerMockProvider{
+		model: "test-model", dims: 3,
+		vector: []float32{0.1, 0.2, 0.3}, failUntil: 3,
+	}
+	w := NewEmbeddingWorker(provider, vs, vi, 10)
+	w.Start(1)
+	defer w.Stop()
+
+	if !w.Enqueue(EmbeddingJob{Collection: "c", DocID: "d", ContentMD: "body"}) {
+		t.Fatal("enqueue refused")
+	}
+	testsync.Wait(t, "the retried job to land its embedding", func() bool {
+		rec, err := vs.Get("c", "d")
+		return err == nil && rec != nil && vi.CollectionSize("c") > 0
+	})
+	if _, _, _, retried, _ := w.QueueStats(); retried != 1 {
+		t.Errorf("retried = %d, want 1 — the job survived one failed processing", retried)
+	}
+	if _, _, dropped, _, _ := w.QueueStats(); dropped != 0 {
+		t.Errorf("dropped = %d, want 0 — a recoverable failure is not a loss", dropped)
+	}
+}
+
+func TestEmbeddingWorker_AttemptBudgetDropsPoisonJob(t *testing.T) {
+	_, vs, vi := embWorkerSetup(t)
+	provider := &embWorkerMockProvider{
+		model: "test-model", dims: 3,
+		vector: []float32{0.1, 0.2, 0.3}, failUntil: 1 << 30,
+	}
+	t.Setenv("MDDB_EMBEDDING_JOB_MAX_ATTEMPTS", "2")
+	t.Setenv("MDDB_EMBEDDING_BREAKER_THRESHOLD", "0") // isolate the job budget from the breaker
+	w := NewEmbeddingWorker(provider, vs, vi, 10)
+	w.Start(1)
+	defer w.Stop()
+
+	if !w.Enqueue(EmbeddingJob{Collection: "c", DocID: "poison", ContentMD: "x"}) {
+		t.Fatal("enqueue refused")
+	}
+	// two processings × ~3s of in-chunk backoff sleeps overshoots
+	// testsync's default window — poll on a manual deadline instead.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		_, _, dropped, _, _ := w.QueueStats()
+		if dropped == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the poison job never exhausted its budget")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if _, _, _, retried, _ := w.QueueStats(); retried != 1 {
+		t.Errorf("retried = %d, want 1 — first failure requeues, second drops", retried)
 	}
 }
