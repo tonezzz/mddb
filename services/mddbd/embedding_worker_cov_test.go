@@ -122,7 +122,7 @@ func TestCovADropJobCountsMetric(t *testing.T) {
 	if w.Enqueue(EmbeddingJob{Collection: "c", DocID: "b"}) {
 		t.Fatal("second job should be dropped")
 	}
-	if _, _, dropped, _ := w.QueueStats(); dropped != 1 {
+	if _, _, dropped, _, _ := w.QueueStats(); dropped != 1 {
 		t.Fatalf("dropped = %d, want 1", dropped)
 	}
 	if !strings.Contains(covAOpsText(t, w.metrics), `operation="embedding",label="dropped"`) {

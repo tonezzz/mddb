@@ -38,6 +38,10 @@ type EmbeddingJob struct {
 	// trace is the span of the request that queued the job, so its
 	// ingest.embed span joins that request's trace (OPS-024). Zero = none.
 	trace tracing.SpanContext
+	// Attempts counts processings that ended in a provider error, including
+	// outage recirculations — it bounds a job's total life so a document
+	// the provider always rejects cannot recirculate forever.
+	Attempts int
 }
 
 // EmbeddingWorker processes embedding jobs asynchronously.
@@ -73,6 +77,17 @@ type EmbeddingWorker struct {
 	// collection and per document, so a search can report or wait for them
 	// (GO-042). The channel alone knows only its global length.
 	pending *pending.Tracker
+	// retried counts jobs handed back to the queue after a provider error
+	// (2026-11-12: before retry existed, a failed job was abandoned silently
+	// — the doc lost its vector with no trace until a full reindex).
+	retried atomic.Uint64
+
+	// maxJobAttempts bounds a job's total life: every failed processing
+	// requeues it (provider outage included — the document is not at fault
+	// during an outage and must survive it), but past this budget it drops
+	// so a permanently-poisoned document cannot hold the breaker open
+	// forever while hiding behind free recirculation.
+	maxJobAttempts int
 
 	// indexer receives every chunk the worker embeds, and drops the chunks a
 	// shrunken document no longer has. The server sets it to all of its
@@ -88,6 +103,11 @@ type EmbeddingWorker struct {
 	parkMu    sync.Mutex
 	parked    []EmbeddingJob
 	parkTimer *time.Timer
+	// breaker pauses embed attempts while the provider looks dead.
+	// Without it a dead upstream turns a full queue into hours of
+	// retries×timeout burn — the 2026-11-08 bge-lessons-shadow storm held
+	// a core at ~90% for 7.5h doing exactly that.
+	breaker *embedBreaker
 }
 
 // jobOutcome is what processing a job came to.
@@ -130,16 +150,18 @@ func (w *EmbeddingWorker) SetIndexer(ix chunkIndexer) {
 // NewEmbeddingWorker creates a new background embedding worker.
 func NewEmbeddingWorker(provider embedding.Provider, store *vec.VectorStore, index *vec.VectorIndex, bufferSize int) *EmbeddingWorker {
 	return &EmbeddingWorker{
-		provider:     provider,
-		vectorStore:  store,
-		vectorIndex:  index,
-		jobs:         make(chan EmbeddingJob, bufferSize),
-		stopCh:       make(chan struct{}),
-		chunkSize:    envconf.Int("MDDB_EMBEDDING_CHUNK_SIZE", 1500),
-		chunkEnabled: envconf.String("MDDB_EMBEDDING_CHUNK_ENABLED", "true") == "true",
-		enqueueWait:  embeddingEnqueueWait(),
-		indexer:      flatIndexer{index},
-		pending:      pending.New(),
+		provider:       provider,
+		vectorStore:    store,
+		vectorIndex:    index,
+		jobs:           make(chan EmbeddingJob, bufferSize),
+		stopCh:         make(chan struct{}),
+		chunkSize:      envconf.Int("MDDB_EMBEDDING_CHUNK_SIZE", 1500),
+		chunkEnabled:   envconf.String("MDDB_EMBEDDING_CHUNK_ENABLED", "true") == "true",
+		enqueueWait:    embeddingEnqueueWait(),
+		indexer:        flatIndexer{index},
+		pending:        pending.New(),
+		breaker:        newEmbedBreaker(),
+		maxJobAttempts: maxEmbeddingJobAttempts(),
 	}
 }
 
@@ -178,8 +200,123 @@ func embeddingEnqueueWait() time.Duration {
 }
 
 // QueueStats reports what the queue is holding and what it has lost.
-func (w *EmbeddingWorker) QueueStats() (size, depth int, dropped uint64, wait time.Duration) {
-	return cap(w.jobs), len(w.jobs), w.dropped.Load(), w.enqueueWait
+func (w *EmbeddingWorker) QueueStats() (size, depth int, dropped, retried uint64, wait time.Duration) {
+	return cap(w.jobs), len(w.jobs), w.dropped.Load(), w.retried.Load(), w.enqueueWait
+}
+
+// maxEmbeddingJobAttempts is how many failed processings a job survives
+// before it is dropped. The default is generous — at the breaker's max
+// 10-minute cooldown it covers roughly an eight-hour provider outage —
+// while still bounded so a permanently rejected document dies instead of
+// recirculating forever and holding the breaker open.
+func maxEmbeddingJobAttempts() int {
+	n := envconf.Int("MDDB_EMBEDDING_JOB_MAX_ATTEMPTS", 50)
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// embedBreaker is a provider-outage circuit breaker for the whole
+// embedding queue. Each failed Embed call counts; past the threshold the
+// circuit opens for an exponential cooldown (base, doubling to max).
+// Workers sleep out the cooldown instead of every queued document burning
+// retries×timeout against a dead upstream — the 2026-11-08
+// bge-lessons-shadow storm was 7.5h of exactly that. On expiry the next
+// attempt is a half-open trial: any failure re-opens at doubled backoff,
+// a success fully resets.
+type embedBreaker struct {
+	consecutive atomic.Int64
+	until       atomic.Int64 // unixnano deadline while the circuit is open
+	backoff     atomic.Int64 // current cooldown (ns); >0 means tripped
+	threshold   int64
+	base        time.Duration
+	max         time.Duration
+}
+
+func newEmbedBreaker() *embedBreaker {
+	b := &embedBreaker{
+		threshold: envconf.Int64("MDDB_EMBEDDING_BREAKER_THRESHOLD", 8),
+		base:      embedBreakerDuration("MDDB_EMBEDDING_BREAKER_BASE", 30*time.Second),
+		max:       embedBreakerDuration("MDDB_EMBEDDING_BREAKER_MAX", 10*time.Minute),
+	}
+	if b.base < time.Second {
+		b.base = time.Second
+	}
+	if b.max < b.base {
+		b.max = b.base
+	}
+	return b
+}
+
+func embedBreakerDuration(key string, def time.Duration) time.Duration {
+	raw := strings.TrimSpace(envconf.String(key, def.String()))
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		slog.Warn(key+" is not a positive duration; using the default",
+			"value", raw, "default", def)
+		return def
+	}
+	return d
+}
+
+// deadline is when an open circuit next allows a trial; zero when closed.
+func (b *embedBreaker) deadline() time.Time {
+	return time.Unix(0, b.until.Load())
+}
+
+// fail records one failed Embed call. The first trip needs `threshold`
+// consecutive failures; once tripped, any failure re-opens immediately
+// with doubled backoff until a success resets.
+func (b *embedBreaker) fail() {
+	if b == nil || b.threshold <= 0 {
+		return // breaker disabled
+	}
+	n := b.consecutive.Add(1)
+	tripped := b.backoff.Load() > 0
+	if !tripped && n < b.threshold {
+		return
+	}
+	bo := time.Duration(b.backoff.Load())
+	if bo < b.base {
+		bo = b.base
+	} else {
+		bo *= 2
+	}
+	if bo > b.max {
+		bo = b.max
+	}
+	b.backoff.Store(int64(bo))
+	b.until.Store(time.Now().Add(bo).UnixNano())
+	b.consecutive.Store(0)
+	slog.Warn("embedding provider circuit open — pausing embed attempts",
+		"backoff", bo, "consecutiveFailures", n)
+}
+
+// succeed closes the circuit: counters and backoff reset.
+func (b *embedBreaker) succeed() {
+	if b == nil {
+		return
+	}
+	b.consecutive.Store(0)
+	b.backoff.Store(0)
+}
+
+// waitBreaker sleeps until the circuit deadline, returning false when the
+// worker is stopping so the caller abandons the job instead of sleeping.
+func (w *EmbeddingWorker) waitBreaker(until time.Time) bool {
+	d := time.Until(until)
+	if d <= 0 {
+		return true
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-w.stopCh:
+		return false
+	}
 }
 
 // Start begins processing embedding jobs in the background.
@@ -233,6 +370,23 @@ func (w *EmbeddingWorker) Enqueue(job EmbeddingJob) bool {
 	}
 
 	return w.dropJob(job)
+}
+
+// requeue hands a failed job back to the tail of the queue without
+// waiting — a retried job must never block a worker behind fresh writes,
+// and when the queue is full the retried job drops first so new documents
+// always win the last slot.
+func (w *EmbeddingWorker) requeue(job EmbeddingJob) bool {
+	select {
+	case w.jobs <- job:
+		w.retried.Add(1)
+		if w.metrics != nil {
+			w.metrics.IncOp("embedding", "retried")
+		}
+		return true
+	default:
+		return w.dropJob(job)
+	}
 }
 
 // dropJob records an abandoned job and always reports failure.
@@ -417,6 +571,15 @@ func (w *EmbeddingWorker) processChunks(job EmbeddingJob) jobOutcome {
 			continue
 		}
 
+		// Circuit breaker: while the provider is systematically down the
+		// circuit is open — sleep it out instead of burning retries×30s
+		// timeouts on every queued document (2026-11-08 embed storm).
+		if until := w.breaker.deadline(); until.After(time.Now()) {
+			if !w.waitBreaker(until) {
+				return jobFailed // worker stopping
+			}
+		}
+
 		// GO-043: the budget is asked once, before the document's first
 		// provider call; a document that starts is finished.
 		if !admitted && w.budget != nil {
@@ -436,14 +599,30 @@ func (w *EmbeddingWorker) processChunks(job EmbeddingJob) jobOutcome {
 				w.budget.spend(job.Collection, chunk)
 			}
 			if embedErr == nil {
+				w.breaker.succeed()
 				break
 			}
 			slog.Warn("embedding attempt failed", "attempt", attempt+1, "collection", job.Collection, "docID", job.DocID, "i", i, "err", embedErr)
+			w.breaker.fail()
+			if w.breaker.deadline().After(time.Now()) {
+				break // circuit just opened — stop burning attempts on this chunk
+			}
 			time.Sleep(time.Duration(attempt+1) * embeddingRetryDelay)
 		}
 
 		if embedErr != nil {
-			slog.Error("embedding failed after all attempts", "collection", job.Collection, "docID", job.DocID, "i", i, "err", embedErr)
+			job.Attempts++
+			if job.Attempts < w.maxJobAttempts {
+				slog.Warn("embedding failed, requeueing job",
+					"collection", job.Collection, "docID", job.DocID, "i", i,
+					"attempts", job.Attempts, "maxAttempts", w.maxJobAttempts, "err", embedErr)
+				w.requeue(job)
+			} else {
+				slog.Error("embedding job dropped after max attempts — document will have no vector until reindexed",
+					"collection", job.Collection, "docID", job.DocID,
+					"attempts", job.Attempts, "err", embedErr)
+				w.dropJob(job)
+			}
 			if w.metrics != nil {
 				w.metrics.IncOp("embedding", "error")
 			}

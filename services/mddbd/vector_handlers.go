@@ -688,11 +688,12 @@ func (s *Server) handleVectorStats(w http.ResponseWriter, r *http.Request) {
 	// still draining (depth > 0) or it gave up on that many documents, and
 	// before this the two looked identical from outside.
 	if s.EmbeddingWorker != nil {
-		size, depth, dropped, wait := s.EmbeddingWorker.QueueStats()
+		size, depth, dropped, retried, wait := s.EmbeddingWorker.QueueStats()
 		resp["queue"] = map[string]interface{}{
 			"size":    size,
 			"depth":   depth,
 			"dropped": dropped,
+			"retried": retried,
 			"wait":    wait.String(),
 		}
 	}
