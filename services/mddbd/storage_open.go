@@ -132,6 +132,12 @@ func freelistSyncFor(path string) bool {
 	case "false", "off":
 		return false
 	}
+	// A replication follower is read-mostly, so the write cost barely
+	// registers, while every restart and every snapshot swap would
+	// otherwise pay the full page-walk rebuild again.
+	if env("MDDB_REPLICATION_ROLE", "") == "follower" {
+		return true
+	}
 	if path == "" {
 		return false
 	}

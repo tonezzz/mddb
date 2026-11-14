@@ -159,7 +159,7 @@ func (s *Server) loadVectorIndex() {
 	}
 	slog.Info("vector index loaded",
 		"documents", totalLoaded, "collections", len(counts), "elapsed", time.Since(start),
-		"algorithms", "flat, hnsw, ivf, pq")
+		"algorithms", strings.Join(searcherNames(s), ", "))
 }
 
 // loadCollectionVectors puts one collection's stored vectors into every

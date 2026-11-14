@@ -9,6 +9,7 @@ import (
 	"mddb/internal/binlog"
 	proto "mddb/proto"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -73,6 +74,8 @@ type ReplicationServer struct {
 	mu        sync.RWMutex
 	// streamSeq numbers binlog streams so each has its own subscription.
 	streamSeq atomic.Uint64
+	// janitor enforces the binlog's size/age retention (leader only).
+	janitor *binlogJanitor
 }
 
 // FollowerState tracks a connected follower
@@ -81,6 +84,10 @@ type FollowerState struct {
 	ConfirmedLSN uint64
 	LastSeenAt   int64
 	Address      string
+	// LastSentAt is the unix time of the last entry or heartbeat the leader
+	// wrote on this follower's stream. Updated per send — an atomic so the
+	// stream goroutine does not need rs.mu on the hot path.
+	LastSentAt atomic.Int64
 }
 
 // NewReplicationServer creates a new replication server
@@ -116,49 +123,73 @@ func (rs *ReplicationServer) RequestSnapshot(req *proto.SnapshotRequest, stream 
 	// Record the LSN at snapshot time
 	snapshotLSN := rs.server.Binlog.CurrentLSN()
 
-	// Use BoltDB's read-only transaction to stream the database
-	err := rs.server.DBView(func(tx *bolt.Tx) error {
-		pr, pw := io.Pipe()
+	// Copy the database image to a temp file first: the read transaction is
+	// then held for a local copy instead of the whole network stream.
+	tmp, err := os.CreateTemp(filepath.Dir(rs.server.Path), "mddb-snapshot-*.db")
+	if err != nil {
+		return status.Errorf(codes.Internal, "snapshot temp file: %v", err)
+	}
+	tmpPath := tmp.Name()
+	_ = tmp.Close()
+	defer func() { _ = os.Remove(tmpPath) }()
 
-		// Write snapshot to pipe in background
-		go func() {
-			_, err := tx.WriteTo(pw)
-			pw.CloseWithError(err)
-		}()
+	if err := rs.server.DBView(func(tx *bolt.Tx) error {
+		return tx.CopyFile(tmpPath, 0o600)
+	}); err != nil {
+		slog.Warn("Replication snapshot copy failed", "followerID", followerID, "err", err)
+		return status.Error(codes.Internal, err.Error())
+	}
 
-		buf := make([]byte, snapshotChunkSize)
-		var offset uint64
-		totalSize := uint64(tx.Size()) // #nosec G115 -- db size always non-negative
+	// Persist the freelist into the copy before streaming. mddb runs with
+	// NoFreelistSync, so the image carries none and every open on the
+	// follower — the integrity check, the restore reopen, every restart —
+	// would rebuild it by walking every page (freepages →
+	// recursivelyCheckBucket), reported at ~1h for a 4GB database under disk
+	// contention. The walk happens once here on the leader instead. It also
+	// proves the copy is a database bbolt can open before any bytes are sent.
+	if err := withWalkProgress("persisting snapshot freelist", []any{"followerID", followerID}, func() error {
+		return persistFreelistFile(tmpPath)
+	}); err != nil {
+		slog.Warn("Replication snapshot freelist flush failed", "followerID", followerID, "err", err)
+		return status.Error(codes.Internal, err.Error())
+	}
 
-		for {
-			n, err := pr.Read(buf)
-			if n > 0 {
-				chunk := &proto.SnapshotChunk{
-					Data:        buf[:n],
-					Offset:      offset,
-					TotalSize:   totalSize,
-					IsLast:      err == io.EOF,
-					SnapshotLsn: snapshotLSN,
-				}
-				if sendErr := stream.Send(chunk); sendErr != nil {
-					_ = pr.Close()
-					return fmt.Errorf("failed to send snapshot chunk: %w", sendErr)
-				}
-				offset += uint64(n)
+	// #nosec G304 -- the temp file this handler just created
+	f, err := os.Open(filepath.Clean(tmpPath))
+	if err != nil {
+		return status.Errorf(codes.Internal, "snapshot reopen: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	info, err := f.Stat()
+	if err != nil {
+		return status.Errorf(codes.Internal, "snapshot stat: %v", err)
+	}
+	totalSize := uint64(info.Size()) // #nosec G115 -- file size is non-negative
+
+	buf := make([]byte, snapshotChunkSize)
+	var offset uint64
+	for {
+		n, err := f.Read(buf)
+		if n > 0 {
+			offset += uint64(n)
+			chunk := &proto.SnapshotChunk{
+				Data:        buf[:n],
+				Offset:      offset - uint64(n),
+				TotalSize:   totalSize,
+				IsLast:      offset == totalSize,
+				SnapshotLsn: snapshotLSN,
 			}
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				return fmt.Errorf("failed to read snapshot: %w", err)
+			if sendErr := stream.Send(chunk); sendErr != nil {
+				return fmt.Errorf("failed to send snapshot chunk: %w", sendErr)
 			}
 		}
-		return nil
-	})
-
-	if err != nil {
-		slog.Warn("Replication snapshot failed", "followerID", followerID, "err", err)
-		return status.Error(codes.Internal, err.Error())
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return status.Errorf(codes.Internal, "failed to read snapshot: %v", err)
+		}
 	}
 
 	slog.Info("replication snapshot completed", "followerID", followerID, "snapshotLSN", snapshotLSN)
@@ -168,6 +199,13 @@ func (rs *ReplicationServer) RequestSnapshot(req *proto.SnapshotRequest, stream 
 // replicationGapCheck is how often an idle binlog stream checks that it has
 // sent everything the log holds.
 const replicationGapCheck = 500 * time.Millisecond
+
+// replicationHeartbeatInterval is how long a binlog stream may go without
+// sending anything before the leader emits a heartbeat entry. A heartbeat
+// carries no LSN and is never applied — it exists so a frozen-but-connected
+// stream (TCP alive, leader loop dead) is distinguishable from an idle one.
+// A var, not a const, so tests can shorten it.
+var replicationHeartbeatInterval = 15 * time.Second
 
 // StreamBinlog streams binlog entries from a given LSN. The stream stays open for continuous tailing.
 func (rs *ReplicationServer) StreamBinlog(req *proto.StreamBinlogRequest, stream proto.MDDBReplication_StreamBinlogServer) error {
@@ -184,6 +222,15 @@ func (rs *ReplicationServer) StreamBinlog(req *proto.StreamBinlogRequest, stream
 	}
 
 	fromLSN := req.FromLsn
+
+	// Anything below the file's oldest entry is gone — including 0. ScanFrom
+	// only rejects 0 < fromLSN < oldest, so a fresh follower (fromLSN 0)
+	// would otherwise be fed every entry the log still holds: replaying the
+	// whole retained history, entry by entry, is strictly worse than taking
+	// the snapshot stream the client falls back to on this same error.
+	if oldest := rs.server.Binlog.OldestLSN(); oldest > 0 && fromLSN < oldest {
+		return status.Error(codes.FailedPrecondition, "LSN too old, snapshot required")
+	}
 
 	// Track follower
 	addr := ""
@@ -225,11 +272,14 @@ func (rs *ReplicationServer) StreamBinlog(req *proto.StreamBinlogRequest, stream
 	defer rs.server.Binlog.Unsubscribe(subID)
 
 	sent := fromLSN
+	lastSent := time.Now()
 	send := func(entry *binlog.BinlogEntry) error {
 		if err := stream.Send(entryToProto(entry)); err != nil {
 			return err
 		}
 		sent = entry.LSN
+		lastSent = time.Now()
+		state.LastSentAt.Store(lastSent.Unix())
 		return nil
 	}
 	catchUp := func() error {
@@ -260,6 +310,8 @@ func (rs *ReplicationServer) StreamBinlog(req *proto.StreamBinlogRequest, stream
 	// the log's current LSN.
 	idle := time.NewTicker(replicationGapCheck)
 	defer idle.Stop()
+	heartbeat := time.NewTicker(replicationHeartbeatInterval)
+	defer heartbeat.Stop()
 	for {
 		select {
 		case <-idle.C:
@@ -268,6 +320,23 @@ func (rs *ReplicationServer) StreamBinlog(req *proto.StreamBinlogRequest, stream
 					return err
 				}
 			}
+		case <-heartbeat.C:
+			// Liveness entry on an idle stream. It deliberately carries
+			// lsn=0/type=0/empty bucket: it never touches `sent`, never
+			// reaches the binlog, and a follower running a pre-heartbeat
+			// build fails it in CreateBucketIfNotExists before the LSN
+			// marker write — warn log, no LSN pollution, no snapshot reset.
+			if time.Since(lastSent) < replicationHeartbeatInterval {
+				continue
+			}
+			if err := stream.Send(&proto.BinlogEntryProto{
+				Heartbeat: true,
+				Timestamp: time.Now().UnixNano(),
+			}); err != nil {
+				return err
+			}
+			lastSent = time.Now()
+			state.LastSentAt.Store(lastSent.Unix())
 		case entry, ok := <-ch:
 			if !ok {
 				return nil // channel closed (binlog shutting down)
@@ -322,6 +391,7 @@ func (rs *ReplicationServer) ReplicationStatus(_ context.Context, _ *proto.Repli
 			LastSeenAt:   fs.LastSeenAt,
 			Address:      fs.Address,
 			LagMs:        lagMs,
+			LastSentAt:   fs.LastSentAt.Load(),
 		})
 	}
 	rs.mu.RUnlock()

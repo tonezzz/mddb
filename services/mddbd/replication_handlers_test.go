@@ -136,6 +136,112 @@ func TestHandleReplicationStatus_Follower(t *testing.T) {
 	}
 }
 
+// ---------- 4b. handleReplicationStatus - follower health reflects replication ----------
+
+func TestHandleReplicationStatus_FollowerHealthyReflectsReplication(t *testing.T) {
+	// A follower whose replication client exists but has never synced must not
+	// report healthy — this is the fresh-follower-at-LSN-0 case.
+	t.Run("no client is unhealthy", func(t *testing.T) {
+		s, cleanup := newHandlerTestServer(t)
+		defer cleanup()
+		s.ReplicationRole = "follower"
+		s.NodeID = "follower-1"
+
+		rec := httptest.NewRecorder()
+		s.handleReplicationStatus(rec, httptest.NewRequest(http.MethodGet, "/v1/replication/status", nil))
+
+		var resp ReplicationStatusResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if resp.Healthy {
+			t.Error("follower with no replication client should be unhealthy")
+		}
+	})
+
+	t.Run("LSN 0 is unhealthy", func(t *testing.T) {
+		s, cleanup := newHandlerTestServer(t)
+		defer cleanup()
+		s.ReplicationRole = "follower"
+		s.NodeID = "follower-1"
+		rc := NewReplicationClient(s, ReplicationClientConfig{LeaderAddr: "leader:11024", FollowerID: "follower-1"})
+		s.replClient = rc
+
+		rec := httptest.NewRecorder()
+		s.handleReplicationStatus(rec, httptest.NewRequest(http.MethodGet, "/v1/replication/status", nil))
+
+		var resp ReplicationStatusResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if resp.Healthy {
+			t.Error("follower at LSN 0 should be unhealthy")
+		}
+		if resp.CurrentLSN != 0 {
+			t.Errorf("expected current_lsn 0, got %d", resp.CurrentLSN)
+		}
+		if resp.LeaderAddr != "leader:11024" {
+			t.Errorf("expected leader_addr reported, got %q", resp.LeaderAddr)
+		}
+	})
+
+	t.Run("caught up is healthy", func(t *testing.T) {
+		s, cleanup := newHandlerTestServer(t)
+		defer cleanup()
+		s.ReplicationRole = "follower"
+		s.NodeID = "follower-1"
+		rc := NewReplicationClient(s, ReplicationClientConfig{LeaderAddr: "leader:11024", FollowerID: "follower-1"})
+		rc.connected.Store(true)
+		rc.applier.SetLastAppliedLSN(1234)
+		rc.lagMs.Store(50)
+		s.replClient = rc
+
+		rec := httptest.NewRecorder()
+		s.handleReplicationStatus(rec, httptest.NewRequest(http.MethodGet, "/v1/replication/status", nil))
+
+		var resp ReplicationStatusResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if !resp.Healthy {
+			t.Error("a caught-up follower should be healthy")
+		}
+		if resp.CurrentLSN != 1234 {
+			t.Errorf("expected current_lsn 1234, got %d", resp.CurrentLSN)
+		}
+		if resp.ReplicationLag != 50 {
+			t.Errorf("expected replication_lag_ms 50, got %d", resp.ReplicationLag)
+		}
+	})
+
+	t.Run("lagging beyond threshold is unhealthy", func(t *testing.T) {
+		s, cleanup := newHandlerTestServer(t)
+		defer cleanup()
+		s.ReplicationRole = "follower"
+		s.NodeID = "follower-1"
+		rc := NewReplicationClient(s, ReplicationClientConfig{
+			LeaderAddr: "leader:11024",
+			FollowerID: "follower-1",
+			MaxLag:     30 * time.Second,
+		})
+		rc.connected.Store(true)
+		rc.applier.SetLastAppliedLSN(1234)
+		rc.lagMs.Store(60_000)
+		s.replClient = rc
+
+		rec := httptest.NewRecorder()
+		s.handleReplicationStatus(rec, httptest.NewRequest(http.MethodGet, "/v1/replication/status", nil))
+
+		var resp ReplicationStatusResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if resp.Healthy {
+			t.Error("a follower lagging beyond maxLag should be unhealthy")
+		}
+	})
+}
+
 // ---------- 5. handleReplicationStatus - uptime is positive ----------
 
 func TestHandleReplicationStatus_UptimePositive(t *testing.T) {

@@ -1,6 +1,6 @@
 # Multi-stage build for minimal image size
 # Stage 1: Build
-FROM golang:1.27.3-alpine AS builder
+FROM docker.io/library/golang:1.27.3-alpine AS builder
 
 # Install build dependencies (git for VCS stamping, make for Makefile targets)
 RUN apk add --no-cache git make
@@ -33,7 +33,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -o mddbd .
 
 # Stage 2: Runtime
-FROM alpine:3.24
+FROM docker.io/library/alpine:3.24
 
 # Add ca-certificates for HTTPS and timezone data
 RUN apk --no-cache add ca-certificates tzdata

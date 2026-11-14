@@ -8,6 +8,8 @@ import (
 
 	"mddb/internal/migrate"
 	"mddb/internal/vector"
+
+	bolt "go.etcd.io/bbolt"
 )
 
 // Manual backup restore (SEC-015 / SEC-016).
@@ -59,6 +61,14 @@ func (s *Server) restoreFromBackup(safeFrom string) error {
 			slog.Warn("failed to reset binlog after restore", "err", err)
 		}
 	}
+
+	// On a follower the restored file also replaced the replicated state the
+	// applier tracks: its persisted LSN marker is whatever the backup held
+	// (often none). Re-read it so the stream resumes from the restored
+	// position — replay if the marker is older, re-snapshot if absent.
+	if s.replClient != nil && s.replClient.applier != nil {
+		s.replClient.applier.ReloadPersistedLSN()
+	}
 	return nil
 }
 
@@ -76,6 +86,17 @@ func (s *Server) restoreFromBackup(safeFrom string) error {
 //
 // MUST be called while holding the restore write lock.
 func (s *Server) swapDatabase(source string, install func(dst string) error) error {
+	return s.swapDatabaseVerified(source, install, verifyDatabase)
+}
+
+// swapDatabaseVerified is swapDatabase with the integrity proof chosen by the
+// caller: verifyDatabase (the full check) for restores, verifySnapshot for a
+// replication snapshot, which is trusted material that arrived complete over
+// the stream and was already opened on the leader — the open proof contains
+// the same panic class without the O(every-page) invariant walk.
+//
+// MUST be called while holding the restore write lock.
+func (s *Server) swapDatabaseVerified(source string, install func(dst string) error, verify func(string) error) error {
 	// The source must be a database bolt can open at all — checked read-only,
 	// before the live file is touched, so a truncated file or a half-received
 	// stream can never destroy the current database.
@@ -85,13 +106,20 @@ func (s *Server) swapDatabase(source string, install func(dst string) error) err
 	// copied while writes were landing passed that check, and the panic came
 	// in reopen below — after the live file had been moved aside, past the
 	// rollback, leaving the server with no open database (#266). The file is
-	// proven by the full check, in a child process (see db_integrity.go).
-	if err := verifyDatabase(source); err != nil {
+	// proven in a child process (see db_integrity.go).
+	if err := verify(source); err != nil {
 		return fmt.Errorf("%s is not a usable database: %w", filepath.Base(source), err)
 	}
 
 	reopen := func() error {
-		db, err := openBolt(s.Path, boltOptionsFor(s.Path))
+		var db *bolt.DB
+		// An unsynced file rebuilds its freelist here by walking every page —
+		// silent for the whole walk without the progress reporting.
+		err := withWalkProgress("reopening database", nil, func() error {
+			var oerr error
+			db, oerr = openBolt(s.Path, boltOptionsFor(s.Path))
+			return oerr
+		})
 		if err != nil {
 			return err
 		}

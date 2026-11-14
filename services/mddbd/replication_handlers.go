@@ -17,6 +17,18 @@ type ReplicationStatusResponse struct {
 	Healthy        bool               `json:"healthy"`
 	Followers      []FollowerInfoJSON `json:"followers,omitempty"`
 	Uptime         int64              `json:"uptime_seconds"`
+
+	// Follower-side stream liveness (only set when role=follower). A
+	// frozen-but-connected stream is distinguishable here: connected stays
+	// true while last_recv_age_ms climbs past heartbeat_timeout_ms.
+	Connected          *bool `json:"connected,omitempty"`
+	LastRecvAt         int64 `json:"last_recv_at,omitempty"`
+	LastRecvAgeMs      int64 `json:"last_recv_age_ms,omitempty"`
+	HeartbeatCapable   *bool `json:"heartbeat_capable,omitempty"`
+	HeartbeatTimeoutMs int64 `json:"heartbeat_timeout_ms,omitempty"`
+
+	// Leader-side heartbeat cadence advertised for stream liveness.
+	HeartbeatIntervalMs int64 `json:"heartbeat_interval_ms,omitempty"`
 }
 
 // FollowerInfoJSON is the JSON representation of a connected follower
@@ -26,7 +38,10 @@ type FollowerInfoJSON struct {
 	ConfirmedLSN uint64 `json:"confirmed_lsn"`
 	LagMs        int64  `json:"lag_ms"`
 	LastSeenAt   int64  `json:"last_seen_at"`
-	Status       string `json:"status"` // healthy, warning, unhealthy
+	// LastSentAt is the last entry or heartbeat the leader wrote on this
+	// stream — a stale value on a connected stream means the send loop froze.
+	LastSentAt int64  `json:"last_sent_at,omitempty"`
+	Status     string `json:"status"` // healthy, warning, unhealthy
 }
 
 var startTime = time.Now()
@@ -51,8 +66,33 @@ func (s *Server) handleReplicationStatus(w http.ResponseWriter, r *http.Request)
 		resp.BinlogSize = stats.FileSize
 	}
 
+	// Follower: healthy must reflect replication state — a fresh follower
+	// reports healthy:true while sitting at LSN 0 otherwise.
+	if s.ReplicationRole == "follower" {
+		if rc := s.replClient; rc != nil {
+			resp.LeaderAddr = rc.leaderAddr
+			resp.CurrentLSN = rc.LastAppliedLSN()
+			resp.ReplicationLag = rc.LagMs()
+			resp.Healthy = rc.IsHealthy()
+
+			connected := rc.connected.Load()
+			resp.Connected = &connected
+			capable := rc.HeartbeatCapable()
+			resp.HeartbeatCapable = &capable
+			resp.HeartbeatTimeoutMs = rc.HeartbeatTimeoutMs()
+			if last := rc.LastRecvAt(); last > 0 {
+				resp.LastRecvAt = last
+				resp.LastRecvAgeMs = time.Since(time.Unix(last, 0)).Milliseconds()
+			}
+		} else {
+			// Configured as a follower with no client running.
+			resp.Healthy = false
+		}
+	}
+
 	// Leader: list connected followers from ReplicationServer
 	if s.ReplicationRole == "leader" && s.Binlog != nil {
+		resp.HeartbeatIntervalMs = replicationHeartbeatInterval.Milliseconds()
 		// We need access to the replication server's follower state.
 		// The gRPC service is registered, so we use a package-level reference.
 		if replServer := s.replServer; replServer != nil {
@@ -77,6 +117,7 @@ func (s *Server) handleReplicationStatus(w http.ResponseWriter, r *http.Request)
 					ConfirmedLSN: fs.ConfirmedLSN,
 					LagMs:        lagMs,
 					LastSeenAt:   fs.LastSeenAt,
+					LastSentAt:   fs.LastSentAt.Load(),
 					Status:       status,
 				})
 			}

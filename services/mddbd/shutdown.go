@@ -58,6 +58,7 @@ func (s *Server) shutdownSteps() []shutdownStep {
 	add("tracing", s.Tracer != nil, s.shutdownTracing)
 
 	// 3. Stop the periodic workers; nothing is producing for them now.
+	add("binlog-janitor", s.replServer != nil, func() { s.replServer.StopBinlogJanitor() })
 	add("ttl", s.TTLManager != nil, func() { s.TTLManager.Stop() })
 	add("temporal", s.TemporalManager != nil, func() { s.TemporalManager.Stop() })
 	add("mvcc", s.MVCC != nil, func() { s.MVCC.Close() })

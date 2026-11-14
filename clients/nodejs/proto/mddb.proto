@@ -1624,6 +1624,11 @@ message BinlogEntryProto {
   bytes key = 5;
   bytes value = 6;
   uint32 checksum = 7;
+  // heartbeat marks a liveness entry emitted by the leader when the binlog
+  // has been idle for the heartbeat interval. It carries no LSN and is
+  // never applied by the follower — it exists purely to keep the stream
+  // distinguishable from a frozen connection.
+  bool heartbeat = 8;
 }
 
 message ReplicationStatusRequest {}
@@ -1646,6 +1651,10 @@ message FollowerInfo {
   int64 last_seen_at = 3;
   string address = 4;
   int64 lag_ms = 5;
+  // last_sent_at is the unix timestamp of the last entry or heartbeat the
+  // leader sent on this follower's stream. A frozen-but-connected stream
+  // shows a stale last_sent_at while the follower still appears connected.
+  int64 last_sent_at = 6;
 }
 
 message AcknowledgeLSNRequest {

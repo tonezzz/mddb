@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"log/slog"
 	"mddb/internal/binlog"
 	"mddb/internal/cache"
@@ -12,6 +13,21 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
+// The applied LSN is persisted in a meta bucket inside the replicated
+// database itself, written in the same BoltDB transaction as the entries it
+// describes. That keeps the marker atomic with the data — it can never run
+// ahead of what is actually in the file, and it costs no extra commit or
+// fsync (the apply transaction was committing anyway). A sidecar file next
+// to mddb.db was the alternative; it was rejected because it survives a
+// manual database replacement and can end up ahead of the restored data,
+// silently skipping entries. The underscore-prefixed bucket is follower-local:
+// the leader never writes it, and a snapshot swap replaces the whole file —
+// requestSnapshot re-persists the snapshot LSN right after the swap.
+var (
+	replMetaBucket = []byte("_mddb_replication")
+	replMetaLSNKey = []byte("last_applied_lsn")
+)
+
 // ReplicationApplier applies binlog entries from the leader to the local BoltDB and in-memory state.
 type ReplicationApplier struct {
 	server      *Server
@@ -20,7 +36,67 @@ type ReplicationApplier struct {
 
 // NewReplicationApplier creates a new replication applier
 func NewReplicationApplier(s *Server) *ReplicationApplier {
-	return &ReplicationApplier{server: s}
+	ra := &ReplicationApplier{server: s}
+	if s != nil && s.DB != nil {
+		if lsn, err := ra.loadPersistedLSN(); err != nil {
+			slog.Warn("replication applier could not read persisted LSN, starting from 0", "err", err)
+		} else if lsn > 0 {
+			ra.lastApplied.Store(lsn)
+			slog.Info("replication applier resuming from persisted LSN", "lsn", lsn)
+		}
+	}
+	return ra
+}
+
+// putAppliedLSN records the applied LSN inside an already-open read-write
+// transaction. Callers invoke it at the tail of the apply transaction so the
+// marker commits (or rolls back) with the data.
+func putAppliedLSN(tx *bolt.Tx, lsn uint64) error {
+	b, err := tx.CreateBucketIfNotExists(replMetaBucket)
+	if err != nil {
+		return err
+	}
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], lsn)
+	return b.Put(replMetaLSNKey, buf[:])
+}
+
+// loadPersistedLSN reads the persisted applied LSN, returning 0 when no
+// marker exists yet (fresh database, or a snapshot that predates this feature).
+func (ra *ReplicationApplier) loadPersistedLSN() (uint64, error) {
+	var lsn uint64
+	err := ra.server.DBView(func(tx *bolt.Tx) error {
+		b := tx.Bucket(replMetaBucket)
+		if b == nil {
+			return nil
+		}
+		if v := b.Get(replMetaLSNKey); len(v) == 8 {
+			lsn = binary.BigEndian.Uint64(v)
+		}
+		return nil
+	})
+	return lsn, err
+}
+
+// PersistLSN writes the LSN marker outside an apply transaction. Used after a
+// snapshot swap, where the incoming database arrived without the marker.
+func (ra *ReplicationApplier) PersistLSN(lsn uint64) error {
+	return ra.server.DBUpdate(func(tx *bolt.Tx) error {
+		return putAppliedLSN(tx, lsn)
+	})
+}
+
+// ReloadPersistedLSN re-reads the marker into memory. Called after a manual
+// restore swapped the database underneath the follower, so the applier
+// resumes from the restored file's position rather than the pre-restore one.
+func (ra *ReplicationApplier) ReloadPersistedLSN() {
+	lsn, err := ra.loadPersistedLSN()
+	if err != nil {
+		slog.Warn("replication applier could not reload persisted LSN after restore", "err", err)
+		return
+	}
+	ra.lastApplied.Store(lsn)
+	slog.Info("replication applier reloaded persisted LSN after restore", "lsn", lsn)
 }
 
 // Apply applies a single binlog entry to the local database.
@@ -106,7 +182,7 @@ func (ra *ReplicationApplier) applyGroup(target string, everywhere bool, group [
 				}
 			}
 		}
-		return nil
+		return putAppliedLSN(tx, group[len(group)-1].LSN)
 	}
 	if everywhere {
 		for _, db := range ra.server.collectionDBs() {

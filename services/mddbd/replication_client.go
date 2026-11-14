@@ -32,12 +32,25 @@ type ReplicationClient struct {
 	conn   *grpc.ClientConn
 	client proto.MDDBReplicationClient
 
-	lastAppliedAt atomic.Int64
-	lagMs         atomic.Int64
-	running       atomic.Bool
-	stopCh        chan struct{}
-	wg            sync.WaitGroup
+	// heartbeatTimeout is the per-Recv waitable deadline: once the leader has
+	// sent a heartbeat (proving it is heartbeat-capable), any silence longer
+	// than this fails the stream so loop() reconnects. <= 0 disables the
+	// deadline. ~3x the leader's heartbeat interval by default.
+	heartbeatTimeout time.Duration
+
+	lastAppliedAt    atomic.Int64
+	lastRecvAt       atomic.Int64
+	heartbeatCapable atomic.Bool // the current stream has seen a heartbeat
+	lagMs            atomic.Int64
+	running          atomic.Bool
+	connected        atomic.Bool // a leader stream is established
+	stopCh           chan struct{}
+	wg               sync.WaitGroup
 }
+
+// defaultReplicationHeartbeatTimeout is ~3x the leader's
+// replicationHeartbeatInterval (15s).
+const defaultReplicationHeartbeatTimeout = 45 * time.Second
 
 // ReplicationClientConfig holds configuration for the replication client
 type ReplicationClientConfig struct {
@@ -46,6 +59,10 @@ type ReplicationClientConfig struct {
 	RetryInterval time.Duration
 	AckInterval   time.Duration
 	MaxLag        time.Duration
+	// HeartbeatTimeout overrides the per-Recv deadline. <= 0 falls back to
+	// MDDB_REPLICATION_HEARTBEAT_TIMEOUT, then the 45s default. An explicit
+	// "0" env value disables the deadline entirely (old-leader escape hatch).
+	HeartbeatTimeout time.Duration
 }
 
 // NewReplicationClient creates a new replication client
@@ -59,16 +76,25 @@ func NewReplicationClient(s *Server, cfg ReplicationClientConfig) *ReplicationCl
 	if cfg.MaxLag <= 0 {
 		cfg.MaxLag = 30 * time.Second
 	}
+	if cfg.HeartbeatTimeout <= 0 {
+		cfg.HeartbeatTimeout = defaultReplicationHeartbeatTimeout
+		if v := env("MDDB_REPLICATION_HEARTBEAT_TIMEOUT", ""); v != "" {
+			if d, err := time.ParseDuration(v); err == nil {
+				cfg.HeartbeatTimeout = d
+			}
+		}
+	}
 
 	return &ReplicationClient{
-		server:        s,
-		leaderAddr:    cfg.LeaderAddr,
-		followerID:    cfg.FollowerID,
-		applier:       NewReplicationApplier(s),
-		retryInterval: cfg.RetryInterval,
-		ackInterval:   cfg.AckInterval,
-		maxLag:        cfg.MaxLag,
-		stopCh:        make(chan struct{}),
+		server:           s,
+		leaderAddr:       cfg.LeaderAddr,
+		followerID:       cfg.FollowerID,
+		applier:          NewReplicationApplier(s),
+		retryInterval:    cfg.RetryInterval,
+		ackInterval:      cfg.AckInterval,
+		maxLag:           cfg.MaxLag,
+		heartbeatTimeout: cfg.HeartbeatTimeout,
+		stopCh:           make(chan struct{}),
 	}
 }
 
@@ -105,13 +131,47 @@ func (rc *ReplicationClient) LastAppliedAt() int64 {
 	return rc.lastAppliedAt.Load()
 }
 
-// IsHealthy returns true if the replication lag is within acceptable bounds
+// LastRecvAt returns the unix timestamp of the last message — entry or
+// heartbeat — received on the current stream. 0 means nothing received since
+// the stream opened.
+func (rc *ReplicationClient) LastRecvAt() int64 {
+	return rc.lastRecvAt.Load()
+}
+
+// HeartbeatCapable reports whether the leader on the current stream has sent
+// at least one heartbeat. The recv deadline only arms on capable leaders —
+// against a pre-heartbeat leader there is no traffic to time out on, so
+// arming unconditionally would just flap the reconnect loop on every idle
+// window.
+func (rc *ReplicationClient) HeartbeatCapable() bool {
+	return rc.heartbeatCapable.Load()
+}
+
+// HeartbeatTimeoutMs returns the configured per-Recv deadline in ms
+// (0 = disabled).
+func (rc *ReplicationClient) HeartbeatTimeoutMs() int64 {
+	return rc.heartbeatTimeout.Milliseconds()
+}
+
+// LastAppliedLSN returns the last binlog LSN applied to the local database —
+// the follower's position in the replication stream.
+func (rc *ReplicationClient) LastAppliedLSN() uint64 {
+	return rc.applier.LastAppliedLSN()
+}
+
+// IsHealthy reports whether replication is actually caught up: a leader
+// stream is established, the follower has applied something (a fresh
+// follower at LSN 0 is still waiting for its first snapshot), and the lag
+// estimate is within maxLag. Time since the last applied entry is NOT the
+// signal — a caught-up follower on an idle leader applies nothing for hours.
 func (rc *ReplicationClient) IsHealthy() bool {
-	lastApplied := rc.lastAppliedAt.Load()
-	if lastApplied == 0 {
-		return false // never applied anything
+	if !rc.connected.Load() {
+		return false
 	}
-	return time.Since(time.Unix(lastApplied, 0)) < rc.maxLag
+	if rc.applier.LastAppliedLSN() == 0 {
+		return false
+	}
+	return rc.lagMs.Load() <= rc.maxLag.Milliseconds()
 }
 
 // loop is the main replication loop with reconnection logic
@@ -156,6 +216,7 @@ func (rc *ReplicationClient) connect() error {
 
 // disconnect closes the gRPC connection
 func (rc *ReplicationClient) disconnect() {
+	rc.connected.Store(false)
 	if rc.conn != nil {
 		_ = rc.conn.Close()
 		rc.conn = nil
@@ -199,38 +260,125 @@ func (rc *ReplicationClient) replicate() error {
 		}
 		return err
 	}
+	rc.connected.Store(true)
+	rc.heartbeatCapable.Store(false)
+	rc.lastRecvAt.Store(0)
 
 	// Start ack goroutine
 	go rc.ackLoop(ctx)
+
+	// Recv runs in its own goroutine: stream.Recv has no per-call deadline,
+	// so the waitable deadline lives in the select below. Without it a
+	// frozen-but-connected stream — TCP alive, leader loop dead — blocks Recv
+	// forever while the follower reports connected/healthy and diverges.
+	type recvResult struct {
+		entry *proto.BinlogEntryProto
+		err   error
+	}
+	recvCh := make(chan recvResult, 1)
+	go func() {
+		for {
+			entry, err := stream.Recv()
+			select {
+			case recvCh <- recvResult{entry, err}:
+				if err != nil {
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	// The deadline only arms after the leader proves heartbeat-capable by
+	// sending a heartbeat. Against a pre-heartbeat leader no periodic traffic
+	// exists to time out on, so arming unconditionally would flap the
+	// reconnect loop on every idle window. deadlineCh stays nil until armed —
+	// a nil channel blocks forever in select, which is exactly the
+	// pre-heartbeat behavior.
+	var deadline *time.Timer
+	var deadlineCh <-chan time.Time
+	defer func() {
+		if deadline != nil {
+			deadline.Stop()
+		}
+	}()
+	resetDeadline := func() {
+		if rc.heartbeatTimeout <= 0 {
+			return
+		}
+		if deadline == nil {
+			deadline = time.NewTimer(rc.heartbeatTimeout)
+		} else {
+			if !deadline.Stop() {
+				select {
+				case <-deadline.C:
+				default:
+				}
+			}
+			deadline.Reset(rc.heartbeatTimeout)
+		}
+		deadlineCh = deadline.C
+	}
 
 	// Receive and apply entries
 	for {
 		select {
 		case <-rc.stopCh:
 			return nil
-		default:
-		}
+		case <-deadlineCh:
+			since := time.Duration(0)
+			if last := rc.lastRecvAt.Load(); last > 0 {
+				since = time.Since(time.Unix(last, 0))
+			}
+			slog.Warn("replication heartbeat timeout",
+				"leaderAddr", rc.leaderAddr,
+				"timeout", rc.heartbeatTimeout,
+				"lastRecvAgo", since)
+			return fmt.Errorf("replication heartbeat timeout: no stream traffic for %s", rc.heartbeatTimeout)
+		case res := <-recvCh:
+			rc.lastRecvAt.Store(time.Now().Unix())
 
-		entry, err := stream.Recv()
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("stream recv error: %w", err)
-		}
+			if res.err == io.EOF {
+				return nil
+			}
+			if res.err != nil {
+				if st, ok := status.FromError(res.err); ok && st.Code() == codes.FailedPrecondition {
+					// Server-side rejection arrives on Recv, not the dial — the
+					// stream opens fine. Same recovery as the dial-time check.
+					slog.Info("replication LSN too old, requesting full snapshot")
+					if err := rc.requestSnapshot(ctx); err != nil {
+						return fmt.Errorf("snapshot failed: %w", err)
+					}
+					return nil
+				}
+				return fmt.Errorf("stream recv error: %w", res.err)
+			}
 
-		// Apply entry
-		binlogEntry := protoToEntry(entry)
-		if err := rc.applier.Apply(binlogEntry); err != nil {
-			slog.Warn("replication failed to apply entry", "lsn", entry.Lsn, "err", err)
-			continue // skip and continue (eventual consistency)
+			entry := res.entry
+			if entry.Heartbeat {
+				// Liveness marker — never applied, never advances the LSN.
+				rc.heartbeatCapable.Store(true)
+				resetDeadline()
+				continue
+			}
+			if rc.heartbeatCapable.Load() {
+				resetDeadline()
+			}
+
+			// Apply entry
+			binlogEntry := protoToEntry(entry)
+			if err := rc.applier.Apply(binlogEntry); err != nil {
+				slog.Warn("replication failed to apply entry", "lsn", entry.Lsn, "err", err)
+				continue // skip and continue (eventual consistency)
+			}
+
+			rc.lastAppliedAt.Store(time.Now().Unix())
+
+			// Update lag estimate
+			entryTime := time.Unix(0, entry.Timestamp)
+			rc.lagMs.Store(time.Since(entryTime).Milliseconds())
 		}
-
-		rc.lastAppliedAt.Store(time.Now().Unix())
-
-		// Update lag estimate
-		entryTime := time.Unix(0, entry.Timestamp)
-		rc.lagMs.Store(time.Since(entryTime).Milliseconds())
 	}
 }
 
@@ -304,6 +452,15 @@ func (rc *ReplicationClient) requestSnapshot(ctx context.Context) error {
 	rc.applier.SetLastAppliedLSN(snapshotLSN)
 	rc.lastAppliedAt.Store(time.Now().Unix())
 
+	// The swapped-in database carries no LSN marker — it is a copy of the
+	// leader's file, which never writes one. Persist the snapshot LSN so a
+	// restart tails the binlog instead of re-snapshotting. Non-fatal: the
+	// in-memory LSN still drives this session, and the first applied entry
+	// writes the marker anyway.
+	if err := rc.applier.PersistLSN(snapshotLSN); err != nil {
+		slog.Warn("replication could not persist snapshot LSN marker", "snapshotLSN", snapshotLSN, "err", err)
+	}
+
 	slog.Info("replication snapshot applied", "snapshotLSN", snapshotLSN)
 	return nil
 }
@@ -323,9 +480,14 @@ func (rc *ReplicationClient) requestSnapshot(ctx context.Context) error {
 // created and is about to delete, and copying a multi-gigabyte file to throw
 // the original away is waste.
 func (rc *ReplicationClient) replaceDatabase(snapshotPath string) error {
-	return rc.server.swapDatabase(snapshotPath, func(dst string) error {
+	// verifySnapshot, not verifyDatabase: the snapshot is trusted material
+	// that arrived complete over the stream (and was already opened on the
+	// leader), so the child proves it opens — freelist walk and panic class
+	// included — and skips the O(every-page) invariant check that used to
+	// time out at MDDB_VERIFY_TIMEOUT on large databases.
+	return rc.server.swapDatabaseVerified(snapshotPath, func(dst string) error {
 		return os.Rename(snapshotPath, dst)
-	})
+	}, verifySnapshot)
 }
 
 // ackLoop periodically sends LSN acknowledgments to the leader

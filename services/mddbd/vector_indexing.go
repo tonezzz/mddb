@@ -1,9 +1,13 @@
 package main
 
 import (
+	"log/slog"
 	"mddb/internal/embedding"
 	"mddb/internal/storage"
 	"mddb/internal/vector"
+	"os"
+	"sort"
+	"strings"
 
 	bolt "go.etcd.io/bbolt"
 )
@@ -111,7 +115,7 @@ func (s *Server) startEmbeddingWorker(provider embedding.Provider) {
 // assembles the indexes differently from production tests a server nobody
 // runs.
 func newVectorSearchers(flat *vector.VectorIndex, quantized *vector.QuantizedVectorIndex, bqRerank int) map[string]vector.VectorSearcher {
-	return map[string]vector.VectorSearcher{
+	searchers := map[string]vector.VectorSearcher{
 		"flat": flat,
 		"hnsw": vector.NewHNSWIndex(vector.DefaultHNSWM, vector.DefaultHNSWEfConstruction, vector.DefaultHNSWEfSearch),
 		"ivf":  vector.NewIVFIndex(10, 20),
@@ -125,4 +129,41 @@ func newVectorSearchers(flat *vector.VectorIndex, quantized *vector.QuantizedVec
 		"bq":        vector.NewBQIndex(bqRerank),
 		"quantized": quantized,
 	}
+
+	// MDDB_VECTOR_ALGORITHMS restricts which searchers are built and kept.
+	// Every vector is inserted into every searcher at startup and on write,
+	// so indexes nobody queries still cost full build time and RAM. "flat"
+	// and "quantized" always survive: flat is the default query path and
+	// quantized backs disk-only collections and per-collection quantization.
+	if allow := os.Getenv("MDDB_VECTOR_ALGORITHMS"); allow != "" {
+		keep := map[string]bool{"flat": true, "quantized": true}
+		for _, a := range strings.Split(allow, ",") {
+			if a = strings.TrimSpace(a); a != "" {
+				keep[a] = true
+			}
+		}
+		var enabled []string
+		for name := range searchers {
+			if keep[name] {
+				enabled = append(enabled, name)
+			} else {
+				delete(searchers, name)
+			}
+		}
+		sort.Strings(enabled)
+		slog.Info("vector algorithms restricted", "enabled", enabled)
+	}
+	return searchers
+}
+
+// searcherNames lists the enabled vector algorithms, sorted. The set varies
+// under MDDB_VECTOR_ALGORITHMS, so logs and error messages report what is
+// actually loaded rather than the full build list.
+func searcherNames(s *Server) []string {
+	names := make([]string, 0, len(s.VectorSearchers))
+	for name := range s.VectorSearchers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }

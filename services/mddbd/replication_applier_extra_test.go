@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"mddb/internal/binlog"
 	"mddb/internal/cache"
 	"mddb/internal/schema"
@@ -526,5 +527,204 @@ func TestUpdateInMemoryState_NilSchemaManager(t *testing.T) {
 	// Should not panic
 	if err := applier.Apply(entry); err != nil {
 		t.Fatalf("Apply: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Persisted applied-LSN marker (_mddb_replication / last_applied_lsn)
+// ---------------------------------------------------------------------------
+
+func persistedLSN(t *testing.T, s *Server) uint64 {
+	t.Helper()
+	var lsn uint64
+	var found bool
+	if err := s.DB.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(replMetaBucket)
+		if b == nil {
+			return nil
+		}
+		if v := b.Get(replMetaLSNKey); len(v) == 8 {
+			lsn = binary.BigEndian.Uint64(v)
+			found = true
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("read persisted LSN: %v", err)
+	}
+	if !found {
+		t.Fatal("expected LSN marker in _mddb_replication bucket")
+	}
+	return lsn
+}
+
+func TestApplier_PersistsAppliedLSN(t *testing.T) {
+	s, cleanup := applierExtraTestServer(t)
+	defer cleanup()
+
+	applier := NewReplicationApplier(s)
+	entry := &binlog.BinlogEntry{
+		LSN:        42,
+		Type:       binlog.BinlogPut,
+		BucketName: "docs",
+		Key:        []byte("doc|blog|x"),
+		Value:      []byte(`{"id":"x"}`),
+	}
+	if err := applier.Apply(entry); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if got := persistedLSN(t, s); got != 42 {
+		t.Errorf("expected persisted LSN 42, got %d", got)
+	}
+}
+
+func TestApplier_PersistsLSNOnCheckpoint(t *testing.T) {
+	s, cleanup := applierExtraTestServer(t)
+	defer cleanup()
+
+	applier := NewReplicationApplier(s)
+	entry := &binlog.BinlogEntry{
+		LSN:        77,
+		Type:       binlog.BinlogCheckpoint,
+		BucketName: "docs",
+	}
+	if err := applier.Apply(entry); err != nil {
+		t.Fatalf("Apply checkpoint: %v", err)
+	}
+	if got := persistedLSN(t, s); got != 77 {
+		t.Errorf("expected persisted LSN 77, got %d", got)
+	}
+}
+
+func TestApplyBatch_PersistsLastLSN(t *testing.T) {
+	s, cleanup := applierExtraTestServer(t)
+	defer cleanup()
+
+	applier := NewReplicationApplier(s)
+	entries := []*binlog.BinlogEntry{
+		{LSN: 10, Type: binlog.BinlogPut, BucketName: "docs", Key: []byte("doc|a"), Value: []byte(`{"id":"a"}`)},
+		{LSN: 11, Type: binlog.BinlogPut, BucketName: "docs", Key: []byte("doc|b"), Value: []byte(`{"id":"b"}`)},
+		{LSN: 12, Type: binlog.BinlogDelete, BucketName: "docs", Key: []byte("doc|a")},
+	}
+	if err := applier.ApplyBatch(entries); err != nil {
+		t.Fatalf("ApplyBatch: %v", err)
+	}
+	if got := persistedLSN(t, s); got != 12 {
+		t.Errorf("expected persisted LSN 12, got %d", got)
+	}
+}
+
+func TestApplier_LoadsPersistedLSNOnStart(t *testing.T) {
+	s, cleanup := applierExtraTestServer(t)
+	defer cleanup()
+
+	// First "process": apply, which persists the marker.
+	first := NewReplicationApplier(s)
+	if err := first.Apply(&binlog.BinlogEntry{
+		LSN: 99, Type: binlog.BinlogPut, BucketName: "docs",
+		Key: []byte("doc|x"), Value: []byte(`{"id":"x"}`),
+	}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	// "Restart": a fresh applier on the same database resumes from the marker
+	// instead of 0, so the stream tails rather than re-snapshotting.
+	second := NewReplicationApplier(s)
+	if got := second.LastAppliedLSN(); got != 99 {
+		t.Errorf("expected resumed LSN 99, got %d", got)
+	}
+}
+
+func TestApplier_LoadsPersistedLSNAcrossReopen(t *testing.T) {
+	s, cleanup := applierExtraTestServer(t)
+	defer cleanup()
+
+	applier := NewReplicationApplier(s)
+	if err := applier.Apply(&binlog.BinlogEntry{
+		LSN: 55, Type: binlog.BinlogPut, BucketName: "docs",
+		Key: []byte("doc|x"), Value: []byte(`{"id":"x"}`),
+	}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	// Full process-restart simulation: close the handle and reopen the file.
+	if err := s.DB.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	db, err := bolt.Open(s.Path, 0600, nil)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	s.DB = db
+
+	restarted := NewReplicationApplier(s)
+	if got := restarted.LastAppliedLSN(); got != 55 {
+		t.Errorf("expected LSN 55 after reopen, got %d", got)
+	}
+}
+
+func TestApplier_NoMarkerStartsAtZero(t *testing.T) {
+	s, cleanup := applierExtraTestServer(t)
+	defer cleanup()
+
+	applier := NewReplicationApplier(s)
+	if got := applier.LastAppliedLSN(); got != 0 {
+		t.Errorf("expected LSN 0 without marker, got %d", got)
+	}
+}
+
+func TestApplier_PersistLSNWritesMarker(t *testing.T) {
+	s, cleanup := applierExtraTestServer(t)
+	defer cleanup()
+
+	applier := NewReplicationApplier(s)
+	if err := applier.PersistLSN(1234); err != nil {
+		t.Fatalf("PersistLSN: %v", err)
+	}
+	if got := persistedLSN(t, s); got != 1234 {
+		t.Errorf("expected persisted LSN 1234, got %d", got)
+	}
+}
+
+func TestApplier_ReloadPersistedLSN(t *testing.T) {
+	s, cleanup := applierExtraTestServer(t)
+	defer cleanup()
+
+	applier := NewReplicationApplier(s)
+	applier.SetLastAppliedLSN(500)
+
+	// A restore swaps in a file whose marker differs from memory.
+	if err := s.DB.Update(func(tx *bolt.Tx) error {
+		return putAppliedLSN(tx, 321)
+	}); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+	applier.ReloadPersistedLSN()
+	if got := applier.LastAppliedLSN(); got != 321 {
+		t.Errorf("expected reloaded LSN 321, got %d", got)
+	}
+}
+
+func TestApplier_MarkerNotReplicatedAsData(t *testing.T) {
+	s, cleanup := applierExtraTestServer(t)
+	defer cleanup()
+
+	applier := NewReplicationApplier(s)
+	if err := applier.Apply(&binlog.BinlogEntry{
+		LSN: 7, Type: binlog.BinlogPut, BucketName: "docs",
+		Key: []byte("doc|x"), Value: []byte(`{"id":"x"}`),
+	}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	// The marker lives only in its own bucket — user buckets stay clean.
+	if err := s.DB.View(func(tx *bolt.Tx) error {
+		docs := tx.Bucket([]byte("docs"))
+		if docs == nil || docs.Get(replMetaLSNKey) != nil {
+			t.Error("LSN marker leaked into the docs bucket")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("view: %v", err)
 	}
 }
