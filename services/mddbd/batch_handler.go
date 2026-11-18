@@ -22,6 +22,11 @@ import (
 type AddBatchHTTPRequest struct {
 	Collection string             `json:"collection"`
 	Documents  []AddBatchDocument `json:"documents"`
+	// SkipEmbeddings stores the batch without queueing vectors — the escape
+	// hatch for a bulk write that cannot afford to wait behind a saturated or
+	// circuit-broken embed queue. Same name as the ingest option; the docs
+	// are left for POST /v1/vector-reindex like dropped ones.
+	SkipEmbeddings bool `json:"skipEmbeddings,omitempty"`
 }
 
 // AddBatchDocument represents a single document within a batch add request.
@@ -88,7 +93,9 @@ func (s *Server) handleAddBatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fire post-batch hooks
-	dropped := s.firePostBatchHooks(req.Collection, processed, postBatchOptions{})
+	dropped := s.firePostBatchHooks(req.Collection, processed, postBatchOptions{
+		SkipEmbeddings: req.SkipEmbeddings,
+	})
 
 	s.Metrics.IncOp("add_batch")
 

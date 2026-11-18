@@ -649,12 +649,27 @@ func (s *Server) handleVectorStats(w http.ResponseWriter, r *http.Request) {
 	// before this the two looked identical from outside.
 	if s.EmbeddingWorker != nil {
 		size, depth, dropped, wait := s.EmbeddingWorker.QueueStats()
-		resp["queue"] = map[string]interface{}{
+		queue := map[string]interface{}{
 			"size":    size,
 			"depth":   depth,
 			"dropped": dropped,
 			"wait":    wait.String(),
 		}
+		// Provider circuit (2026-11-18 outage): while it is open every write
+		// is stored without its vector and `dropped` keeps climbing — the
+		// state a monitor needs to see BEFORE writes start timing out, since
+		// the queue being full is also what a healthy import looks like.
+		open, failures, retryAfter := s.EmbeddingWorker.CircuitStats()
+		circuit := map[string]interface{}{
+			"state":               "closed",
+			"consecutiveFailures": failures,
+		}
+		if open {
+			circuit["state"] = "open"
+			circuit["retryAfterSeconds"] = retryAfter.Seconds()
+		}
+		queue["circuit"] = circuit
+		resp["queue"] = queue
 	}
 
 	ok(w, resp)

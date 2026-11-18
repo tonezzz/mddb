@@ -183,6 +183,11 @@ type AddRequest struct {
 	Meta       map[string][]string `json:"meta"`
 	ContentMD  string              `json:"contentMd"`
 	TTL        int64               `json:"ttl,omitempty"` // seconds; 0 = no expiry
+	// SkipEmbedding stores the document without queueing its vector — the
+	// per-request bypass for a caller that does not need vector/hybrid search
+	// on this write and cannot afford to wait behind a saturated embed queue.
+	// The document is left for POST /v1/vector-reindex like a dropped one.
+	SkipEmbedding bool `json:"skipEmbedding,omitempty"`
 }
 
 // GetRequest is the HTTP request body for retrieving a document.

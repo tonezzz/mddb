@@ -26,6 +26,17 @@ import (
 // per-request SaveRevision flag); all other callers pass true to preserve the
 // always-record-a-revision behaviour they have always had.
 func (s *Server) addDocument(collection, key, lang string, meta map[string][]string, contentMD string, ttl int64, saveRevision bool) (storage.Doc, bool, error) {
+	doc, isNew, _, err := s.addDocumentEx(collection, key, lang, meta, contentMD, ttl, saveRevision, false)
+	return doc, isNew, err
+}
+
+// addDocumentEx is addDocument with two extra knobs the HTTP write path needs:
+// skipEmbedding stores the document without queueing its vector at all (the
+// per-request bypass for callers that do not need search on this write), and
+// the third return reports whether an embedding the caller expected was
+// deferred — refused by the queue or declined by an open provider circuit —
+// so the write endpoint can say so instead of answering a bare 200.
+func (s *Server) addDocumentEx(collection, key, lang string, meta map[string][]string, contentMD string, ttl int64, saveRevision, skipEmbedding bool) (storage.Doc, bool, bool, error) {
 	// GO-003: validate in the single write path so EVERY transport is covered.
 	// Previously only gRPC Add and HTTP handleAdd validated; MCP (DirectClient)
 	// and GraphQL went straight to addDocument with no checks, and the batch
@@ -33,11 +44,11 @@ func (s *Server) addDocument(collection, key, lang string, meta map[string][]str
 	// (no-op unless a schema is registered for the collection), so this is safe
 	// for internal callers (memory/upload/import) too.
 	if collection == "" || key == "" || lang == "" {
-		return storage.Doc{}, false, errors.New("missing required field: collection, key and lang are required")
+		return storage.Doc{}, false, false, errors.New("missing required field: collection, key and lang are required")
 	}
 	if s.SchemaManager != nil {
 		if err := s.SchemaManager.Validate(collection, meta); err != nil {
-			return storage.Doc{}, false, err
+			return storage.Doc{}, false, false, err
 		}
 	}
 	// GO-036: refuse text protobuf cannot store, here for the same reason as
@@ -49,7 +60,7 @@ func (s *Server) addDocument(collection, key, lang string, meta map[string][]str
 	// `caf` and tells nobody. Bulk paths sanitise and count instead; see
 	// text_encoding.go.
 	if err := ValidateDocumentText(contentMD, meta); err != nil {
-		return storage.Doc{}, false, err
+		return storage.Doc{}, false, false, err
 	}
 
 	now := time.Now().Unix()
@@ -164,7 +175,7 @@ func (s *Server) addDocument(collection, key, lang string, meta map[string][]str
 		bo.FlushTo(s.Binlog)
 	}
 	if err != nil {
-		return storage.Doc{}, false, err
+		return storage.Doc{}, false, false, err
 	}
 
 	// Refresh the read cache so a subsequent gRPC Get (the only path that
@@ -181,9 +192,9 @@ func (s *Server) addDocument(collection, key, lang string, meta map[string][]str
 	}
 
 	// Side-effect pipeline shared by every write transport (GO-001).
-	s.runPostWriteHooks(collection, saved, isNew)
+	deferred := s.runPostWriteHooks(collection, saved, isNew, skipEmbedding)
 
-	return saved, isNew, nil
+	return saved, isNew, deferred, nil
 }
 
 // runPostWriteHooks runs the side-effect pipeline that must fire after a
@@ -198,24 +209,32 @@ func (s *Server) addDocument(collection, key, lang string, meta map[string][]str
 // Revision writing and MaxRevisions trimming are intentionally NOT here: they
 // must happen inside the write transaction (see addDocument / the batch
 // commits) so a crash can never leave a doc without its revision.
-func (s *Server) runPostWriteHooks(collection string, saved storage.Doc, isNew bool) {
+//
+// The return reports an embedding the caller asked for but did not get —
+// refused by a full queue or declined by an open provider circuit — so the
+// write endpoint can mark the response "needs reindex". A skipEmbedding write
+// is not deferred: nothing was asked for, so nothing was lost.
+func (s *Server) runPostWriteHooks(collection string, saved storage.Doc, isNew, skipEmbedding bool) (embedDeferred bool) {
 	// A write changes what a search returns, so cached result sets for this
 	// collection must stop being reachable (GO-031). This is the shared
 	// pipeline for every write transport, so one call covers them all.
 	s.invalidateSearchCache(collection)
 
 	// Trigger async embedding
-	if s.EmbeddingWorker != nil && saved.ContentMD != "" {
+	if s.EmbeddingWorker != nil && saved.ContentMD != "" && !skipEmbedding {
 		// The drop is not discarded, it is counted: the worker logs the
 		// document and /v1/vector-stats reports the running total (#232).
-		// A single write has nothing useful to do with the boolean that a
-		// batch does — there is no per-request tally to add it to.
-		_ = s.EmbeddingWorker.Enqueue(EmbeddingJob{
+		// The write path additionally reports it back, so a single /v1/add
+		// during a provider outage answers "stored, vector deferred" instead
+		// of a bare 200 that reads as fully indexed.
+		if !s.EmbeddingWorker.Enqueue(EmbeddingJob{
 			Collection: collection,
 			DocID:      saved.ID,
 			ContentMD:  saved.ContentMD,
 			ChunkMode:  ChunkModeFor(&saved),
-		})
+		}) {
+			embedDeferred = true
+		}
 	}
 
 	// TTL bucket entry
@@ -288,6 +307,7 @@ func (s *Server) runPostWriteHooks(collection string, saved storage.Doc, isNew b
 		}
 		go s.AutomationManager.EvaluateTriggers(collection, saved, triggerEvent)
 	}
+	return embedDeferred
 }
 
 // deleteDocumentInternal deletes a document and all its associated data.

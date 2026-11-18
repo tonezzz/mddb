@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"mddb/internal/embedding"
@@ -13,6 +14,11 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// errEmbedCircuitOpen marks a chunk abandoned because the provider circuit
+// opened mid-job — distinct from a provider error so the "after all attempts"
+// log line says what actually happened.
+var errEmbedCircuitOpen = errors.New("embedding provider circuit open")
 
 // EmbeddingJob represents a document that needs embedding.
 type EmbeddingJob struct {
@@ -54,6 +60,25 @@ type EmbeddingWorker struct {
 	// rather than a mystery.
 	dropped atomic.Uint64
 
+	// Provider circuit breaker. When the embed provider is down hard —
+	// rate-limited, out of quota, unreachable — every queued job still burns
+	// its full retry budget before failing, the queue stays pinned at its
+	// cap, and every writer pays the entire enqueueWait before its job is
+	// abandoned anyway. During the 2026-11-18 provider outage that wait was
+	// the difference between a write and a timeout: /v1/add callers hung
+	// ~30s and died before the document landed.
+	//
+	// The breaker counts consecutive failed Embed calls. At
+	// circuitThreshold it opens for circuitCooldown: Enqueue drops fast
+	// instead of waiting, and processJob declines jobs without touching the
+	// provider, so a saturated queue drains instead of backing up writes.
+	// The document itself is always stored — what is deferred is the vector,
+	// recoverable afterwards with POST /v1/vector-reindex.
+	consecFailures   atomic.Int64
+	circuitOpenUntil atomic.Int64 // unixnano; open while now < this
+	circuitThreshold int64
+	circuitCooldown  time.Duration
+
 	// indexer receives every chunk the worker embeds, and drops the chunks a
 	// shrunken document no longer has. The server sets it to all of its
 	// indexes; left alone it is the flat index, which is what tests of the
@@ -85,16 +110,19 @@ func (w *EmbeddingWorker) SetIndexer(ix chunkIndexer) {
 
 // NewEmbeddingWorker creates a new background embedding worker.
 func NewEmbeddingWorker(provider embedding.Provider, store *vec.VectorStore, index *vec.VectorIndex, bufferSize int) *EmbeddingWorker {
+	threshold, cooldown := embeddingCircuitConfig()
 	return &EmbeddingWorker{
-		provider:     provider,
-		vectorStore:  store,
-		vectorIndex:  index,
-		jobs:         make(chan EmbeddingJob, bufferSize),
-		stopCh:       make(chan struct{}),
-		chunkSize:    envconf.Int("MDDB_EMBEDDING_CHUNK_SIZE", 1500),
-		chunkEnabled: envconf.String("MDDB_EMBEDDING_CHUNK_ENABLED", "true") == "true",
-		enqueueWait:  embeddingEnqueueWait(),
-		indexer:      flatIndexer{index},
+		provider:         provider,
+		vectorStore:      store,
+		vectorIndex:      index,
+		jobs:             make(chan EmbeddingJob, bufferSize),
+		stopCh:           make(chan struct{}),
+		chunkSize:        envconf.Int("MDDB_EMBEDDING_CHUNK_SIZE", 1500),
+		chunkEnabled:     envconf.String("MDDB_EMBEDDING_CHUNK_ENABLED", "true") == "true",
+		enqueueWait:      embeddingEnqueueWait(),
+		circuitThreshold: threshold,
+		circuitCooldown:  cooldown,
+		indexer:          flatIndexer{index},
 	}
 }
 
@@ -132,6 +160,85 @@ func embeddingEnqueueWait() time.Duration {
 	return d
 }
 
+// embeddingCircuitConfig reads the provider circuit breaker's two knobs.
+//
+// MDDB_EMBEDDING_CIRCUIT_FAILURES is how many consecutive provider calls may
+// fail before the worker stops asking. It counts calls, not jobs: a single
+// document that burns through its retries is most of the way there already.
+// Zero or a negative value disables the breaker, restoring the behaviour of
+// waiting out every provider outage — the field exists for an operator who
+// would rather have writes block than lose vectors.
+//
+// MDDB_EMBEDDING_CIRCUIT_COOLDOWN is how long the breaker stays open before
+// jobs flow again. The first success closes it for real; the first failure
+// reopens it, so a flapping provider produces bursts of attempts with quiet
+// stretches between, not a steady trickle of 30-second stalls.
+func embeddingCircuitConfig() (threshold int64, cooldown time.Duration) {
+	threshold = int64(envconf.Int("MDDB_EMBEDDING_CIRCUIT_FAILURES", 5))
+	raw := strings.TrimSpace(envconf.String("MDDB_EMBEDDING_CIRCUIT_COOLDOWN", "30s"))
+	cooldown = 30 * time.Second
+	if raw != "" {
+		if d, err := time.ParseDuration(raw); err != nil || d < 0 {
+			slog.Warn("MDDB_EMBEDDING_CIRCUIT_COOLDOWN is not a duration; using the default",
+				"value", raw, "default", "30s")
+		} else {
+			cooldown = d
+		}
+	}
+	return threshold, cooldown
+}
+
+// CircuitOpen reports whether the provider circuit is open — embedding jobs
+// are being declined without reaching the provider. Read by Enqueue,
+// processJob, and the stats endpoints that show an operator why vectors are
+// not arriving.
+func (w *EmbeddingWorker) CircuitOpen() bool {
+	until := w.circuitOpenUntil.Load()
+	return until != 0 && time.Now().UnixNano() < until
+}
+
+// CircuitStats reports the breaker state for /v1/vector-stats and /health:
+// whether it is open, the consecutive-failure streak that opened it, and how
+// long until jobs flow again (zero when closed).
+func (w *EmbeddingWorker) CircuitStats() (open bool, consecutiveFailures int64, retryAfter time.Duration) {
+	until := w.circuitOpenUntil.Load()
+	if until != 0 {
+		if d := time.Until(time.Unix(0, until)); d > 0 {
+			return true, w.consecFailures.Load(), d
+		}
+	}
+	return false, w.consecFailures.Load(), 0
+}
+
+// noteEmbedSuccess closes the failure streak — one good call means the
+// provider is back, and the next cooldown expiry does not need proof.
+func (w *EmbeddingWorker) noteEmbedSuccess() {
+	w.consecFailures.Store(0)
+}
+
+// noteEmbedFailure counts a failed provider call and opens the circuit when
+// the streak reaches the threshold. Reaching the threshold again while open
+// extends the window, which is what keeps a still-down provider from being
+// retried the moment the cooldown ends.
+func (w *EmbeddingWorker) noteEmbedFailure(err error) {
+	if w.circuitThreshold <= 0 {
+		return // breaker disabled
+	}
+	n := w.consecFailures.Add(1)
+	if n >= w.circuitThreshold && !w.CircuitOpen() {
+		w.circuitOpenUntil.Store(time.Now().Add(w.circuitCooldown).UnixNano())
+		slog.Warn("embedding provider circuit open: writes will be stored without vectors until the provider recovers",
+			"consecutiveFailures", n, "cooldown", w.circuitCooldown,
+			"err", err,
+			"remedy", "restore the provider, then POST /v1/vector-reindex for the dropped documents")
+	} else if n >= w.circuitThreshold {
+		// Still failing while open: push the re-probe out. A fixed window
+		// measured from the first failure would let a persistently-down
+		// provider be retried mid-outage.
+		w.circuitOpenUntil.Store(time.Now().Add(w.circuitCooldown).UnixNano())
+	}
+}
+
 // QueueStats reports what the queue is holding and what it has lost.
 func (w *EmbeddingWorker) QueueStats() (size, depth int, dropped uint64, wait time.Duration) {
 	return cap(w.jobs), len(w.jobs), w.dropped.Load(), w.enqueueWait
@@ -157,6 +264,14 @@ func (w *EmbeddingWorker) Stop() {
 // full. Returns false only when the job was abandoned, which the caller is
 // expected to report rather than ignore (#232).
 func (w *EmbeddingWorker) Enqueue(job EmbeddingJob) bool {
+	// Provider circuit open: the job would sit behind a queue the worker is
+	// draining without embeddings anyway, so there is nothing to wait for.
+	// Dropping fast is what keeps a write endpoint from spending its whole
+	// enqueueWait discovering the provider is still down (2026-11-18).
+	if w.CircuitOpen() {
+		return w.dropJob(job, "provider_circuit_open")
+	}
+
 	// Fast path: room now, which is every write on an idle server.
 	select {
 	case w.jobs <- job:
@@ -177,16 +292,17 @@ func (w *EmbeddingWorker) Enqueue(job EmbeddingJob) bool {
 		}
 	}
 
-	return w.dropJob(job)
+	return w.dropJob(job, "queue_full")
 }
 
 // dropJob records an abandoned job and always reports failure.
-func (w *EmbeddingWorker) dropJob(job EmbeddingJob) bool {
+func (w *EmbeddingWorker) dropJob(job EmbeddingJob, reason string) bool {
 	w.dropped.Add(1)
 	if w.metrics != nil {
 		w.metrics.IncOp("embedding", "dropped")
 	}
-	slog.Warn("embedding queue full, dropping job — this document will have no vector until it is reindexed",
+	slog.Warn("embedding job dropped — this document will have no vector until it is reindexed",
+		"reason", reason,
 		"collection", job.Collection, "docID", job.DocID,
 		"queueSize", cap(w.jobs), "waited", w.enqueueWait, "droppedTotal", w.dropped.Load())
 	return false
@@ -220,6 +336,15 @@ func (w *EmbeddingWorker) processJob(job EmbeddingJob) {
 	existing, err := w.vectorStore.Get(job.Collection, job.DocID)
 	if err == nil && existing != nil && existing.ContentHash == contentHash {
 		return // embedding is up-to-date
+	}
+
+	// Circuit open: the provider is down and this job can only fail after its
+	// full retry budget. Decline it like a queue drop — counted, logged,
+	// reindexable — so a backed-up queue drains in seconds instead of
+	// burning 30s+ per document on a provider that cannot answer.
+	if w.CircuitOpen() {
+		w.dropJob(job, "provider_circuit_open")
+		return
 	}
 
 	// Split into chunks if enabled
@@ -261,12 +386,20 @@ func (w *EmbeddingWorker) processJob(job EmbeddingJob) {
 		var vector []float32
 		var embedErr error
 		for attempt := 0; attempt < 3; attempt++ {
+			// A failure partway through the retries may have opened the
+			// circuit: stop spending sleeps on a job that is already lost.
+			if w.CircuitOpen() {
+				embedErr = errEmbedCircuitOpen
+				break
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			vector, embedErr = w.provider.Embed(ctx, chunk, embedding.RoleDocument)
 			cancel()
 			if embedErr == nil {
+				w.noteEmbedSuccess()
 				break
 			}
+			w.noteEmbedFailure(embedErr)
 			slog.Warn("embedding attempt failed", "attempt", attempt+1, "collection", job.Collection, "docID", job.DocID, "i", i, "err", embedErr)
 			time.Sleep(time.Duration(attempt+1) * time.Second)
 		}
