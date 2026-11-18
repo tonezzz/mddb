@@ -359,6 +359,8 @@ Query parameters on `GET /v1/audit`: `from` / `to` (RFC3339) or `fromNanos` / `t
 | `MDDB_EMBEDDING_CHUNK_SIZE` | `1500` | int | Maximum chunk size in characters |
 | `MDDB_EMBEDDING_QUEUE_SIZE` | `1000` | int | (v2.15.0+) Pending embedding jobs the worker will hold. Raise it for large imports; it was hardcoded before |
 | `MDDB_EMBEDDING_QUEUE_WAIT` | `5s` | duration | (v2.15.0+) How long a write waits for room in a full queue before the document is stored without its vector. `0` restores the pre-2.15.0 behaviour of giving up immediately — faster ingest, and documents that no vector or hybrid search can reach until reindexed |
+| `MDDB_EMBEDDING_CIRCUIT_FAILURES` | `5` | int | (v2.15.5+) Consecutive provider failures before the embedding circuit opens. While open, writes are stored without their vector immediately instead of waiting out `QUEUE_WAIT` — a dead provider stops stalling write endpoints. `0` disables the breaker and restores always-wait behaviour |
+| `MDDB_EMBEDDING_CIRCUIT_COOLDOWN` | `30s` | duration | (v2.15.5+) How long the circuit stays open before jobs flow again; the first success closes it, the first failure reopens it |
 | `MDDB_EMBEDDING_CACHE_SIZE` | `1024` | int | (v2.12.0+) Embeddings held in the query cache; `0` disables caching and restores the pre-2.12.0 path exactly |
 | `MDDB_EMBEDDING_CACHE_TTL` | `3600` | int | (v2.12.0+) Cache entry lifetime in seconds |
 

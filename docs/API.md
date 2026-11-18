@@ -172,6 +172,15 @@ Add or update a markdown document in a collection.
 - Maintains revision history
 - Updates metadata indices
 - Tracks `addedAt` (first creation) and `updatedAt` (last modification) timestamps
+- `skipEmbedding` (optional, v2.15.5+): store the document without queueing its
+  vector — the per-request bypass when the caller does not need vector/hybrid
+  search on this write and cannot afford to wait behind a saturated embed queue
+
+**Response headers** (v2.15.5+, only when relevant):
+- `X-MDDB-Embedding: deferred` — the write wanted a vector the embedding queue
+  refused (full queue, or the provider circuit is open). The document IS stored;
+  it needs `POST /v1/vector-reindex` before vector or hybrid search can see it.
+- `X-MDDB-Embedding: skipped` — the caller passed `skipEmbedding: true`.
 
 **cURL Example**:
 ```bash
@@ -229,6 +238,9 @@ Add multiple documents to a collection in a single request. Uses the optimized b
   - `contentMd` (required): Markdown content
   - `meta` (optional): Metadata key-value pairs
   - `saveRevision` (optional): Whether to save a revision for this document
+- `skipEmbeddings` (optional, v2.15.5+): store the whole batch without queueing
+  vectors — the escape hatch for a bulk write that cannot wait behind a
+  saturated or circuit-broken embed queue
 
 **Response**:
 ```json
@@ -879,7 +891,11 @@ Get embedding/vector search statistics.
     "size": 1000,
     "depth": 2,
     "dropped": 0,
-    "wait": "5s"
+    "wait": "5s",
+    "circuit": {
+      "state": "closed",
+      "consecutiveFailures": 0
+    }
   }
 }
 ```
@@ -891,8 +907,9 @@ Get embedding/vector search statistics.
 |---|---|
 | `size` | Queue capacity (`MDDB_EMBEDDING_QUEUE_SIZE`) |
 | `depth` | Jobs waiting right now — above zero means embedding is still running |
-| `dropped` | Documents stored **without** a vector since startup, because the queue was full and the write gave up waiting. Repair with `POST /v1/vector-reindex` |
+| `dropped` | Documents stored **without** a vector since startup, because the queue was full and the write gave up waiting, or the provider circuit was open. Repair with `POST /v1/vector-reindex` |
 | `wait` | How long a write waits for room before dropping (`MDDB_EMBEDDING_QUEUE_WAIT`) |
+| `circuit` | (v2.15.5+) Provider circuit breaker: `state` is `open` while the provider is considered down — writes are then stored without vectors immediately rather than waiting — plus the `consecutiveFailures` streak and, while open, `retryAfterSeconds` until jobs are tried again (`MDDB_EMBEDDING_CIRCUIT_FAILURES` / `MDDB_EMBEDDING_CIRCUIT_COOLDOWN`) |
 
 **cURL Example**:
 ```bash

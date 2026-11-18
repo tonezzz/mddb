@@ -293,6 +293,16 @@ paths:
       responses:
         "200":
           description: Document added/updated successfully
+          headers:
+            X-MDDB-Embedding:
+              schema:
+                type: string
+                enum: [deferred, skipped]
+              description: >-
+                (v2.15.5+) Present only when the write did not get the vector
+                it asked for. `deferred`: the embedding queue refused the job
+                (full queue or open provider circuit) — reindex later.
+                `skipped`: the request set skipEmbedding.
           content:
             application/json:
               schema:
@@ -6046,6 +6056,15 @@ components:
           type: string
           description: Markdown content
           example: "# Hello World\n\nWelcome to MDDB!"
+        skipEmbedding:
+          type: boolean
+          description: >-
+            (v2.15.5+) Store the document without queueing its vector — the
+            per-request bypass for callers that do not need vector/hybrid
+            search on this write and cannot afford to wait behind a saturated
+            embed queue. The document is left for POST /v1/vector-reindex.
+            The response carries X-MDDB-Embedding: skipped.
+          default: false
 
     AddBatchRequest:
       type: object
@@ -6062,6 +6081,13 @@ components:
           items:
             $ref: "#/components/schemas/AddBatchDocument"
           description: Documents to add
+        skipEmbeddings:
+          type: boolean
+          description: >-
+            (v2.15.5+) Store the batch without queueing vectors — the escape
+            hatch for a bulk write that cannot wait behind a saturated or
+            circuit-broken embed queue.
+          default: false
 
     AddBatchDocument:
       type: object
@@ -6967,6 +6993,28 @@ components:
               type: string
               description: How long a write waits for queue room (MDDB_EMBEDDING_QUEUE_WAIT)
               example: "5s"
+            circuit:
+              type: object
+              description: >-
+                (v2.15.5+) Provider circuit breaker state. While `state` is
+                `open` the embed provider is considered down: writes are
+                stored without their vector immediately instead of waiting
+                out the queue, and `dropped` keeps climbing. See
+                MDDB_EMBEDDING_CIRCUIT_FAILURES / MDDB_EMBEDDING_CIRCUIT_COOLDOWN.
+              properties:
+                state:
+                  type: string
+                  enum: [open, closed]
+                  example: closed
+                consecutiveFailures:
+                  type: integer
+                  format: int64
+                  description: Consecutive failed provider calls
+                  example: 0
+                retryAfterSeconds:
+                  type: number
+                  description: Present only while open — seconds until jobs are tried again
+                  example: 30
         chunking:
           type: object
           properties:

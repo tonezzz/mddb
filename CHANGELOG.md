@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Embedding provider circuit breaker** (`MDDB_EMBEDDING_CIRCUIT_FAILURES`,
+  default 5; `MDDB_EMBEDDING_CIRCUIT_COOLDOWN`, default 30s). When the embed
+  provider is down hard, every queued job used to burn its full retry budget
+  and every write paid the whole `MDDB_EMBEDDING_QUEUE_WAIT` before its
+  embedding was dropped anyway — during the 2026-11-18 provider outage that
+  meant `/v1/add` callers hung ~30s and timed out. While the circuit is open,
+  writes are stored without their vector and answered immediately; the worker
+  also declines its backlog without calling the dead provider, so a pinned
+  queue drains in seconds. The first success after the cooldown closes it.
+  `MDDB_EMBEDDING_CIRCUIT_FAILURES=0` restores always-wait behaviour.
+- **`X-MDDB-Embedding` response header on `POST /v1/add`**: `deferred` when
+  the write wanted a vector the queue refused (needs `POST /v1/vector-reindex`
+  before vector/hybrid search sees it), `skipped` for the new
+  `skipEmbedding` request flag — a per-request bypass for callers that do not
+  need vectors. `POST /v1/add-batch` gained the matching `skipEmbeddings`
+  flag.
+- **Embed pipeline state in `/health` and `/v1/vector-stats`**: queue depth,
+  dropped count and circuit state (`open`/`closed`, `consecutiveFailures`,
+  `retryAfterSeconds`) are now visible before writes start timing out instead
+  of only after.
+
 ### Fixed
 
 - **`GET /v1/stats` walked every key in `docs`, `rev` and `idxmeta` on every

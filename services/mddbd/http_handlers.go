@@ -46,10 +46,20 @@ func (s *Server) handleAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	saved, _, err := s.addDocument(req.Collection, req.Key, req.Lang, req.Meta, req.ContentMD, req.TTL, true)
+	saved, _, deferred, err := s.addDocumentEx(req.Collection, req.Key, req.Lang, req.Meta, req.ContentMD, req.TTL, true, req.SkipEmbedding)
 	if err != nil {
 		bad(w, err)
 		return
+	}
+	// The document is stored either way; the header is the marker. "deferred"
+	// means the write wanted a vector the embed queue would not take — the
+	// document needs POST /v1/vector-reindex before vector or hybrid search
+	// can see it. "skipped" is the same state the caller asked for.
+	switch {
+	case deferred:
+		w.Header().Set("X-MDDB-Embedding", "deferred")
+	case req.SkipEmbedding:
+		w.Header().Set("X-MDDB-Embedding", "skipped")
 	}
 	ok(w, saved)
 }
@@ -520,6 +530,25 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	// available:false — from "we do not know".
 	if update := s.UpdateStatus; update != nil {
 		body["update"] = update
+	}
+	// Embedding pipeline state (2026-11-18): a monitor watching only the 200
+	// cannot tell "provider down, every write stored without its vector" from
+	// healthy — both answer promptly now. The counters are atomics and a
+	// channel length; this costs the endpoint nothing.
+	if w := s.EmbeddingWorker; w != nil {
+		size, depth, dropped, _ := w.QueueStats()
+		open, failures, retryAfter := w.CircuitStats()
+		emb := map[string]any{
+			"queueSize":           size,
+			"queueDepth":          depth,
+			"dropped":             dropped,
+			"circuitOpen":         open,
+			"consecutiveFailures": failures,
+		}
+		if open {
+			emb["circuitRetryAfterSeconds"] = retryAfter.Seconds()
+		}
+		body["embedding"] = emb
 	}
 
 	w.Header().Set("Content-Type", "application/json")
